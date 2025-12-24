@@ -11,6 +11,8 @@ import { fileURLToPath } from 'url';
 import { initDB } from './lib/db.js';
 import { initParseRoutes } from './routes/parse.js';
 import { initAIChartV3Routes } from './routes/aiChartV3.js';
+import { initAnalysisV3Routes } from './routes/analysisV3.js';
+import { initAuthRoutes } from './routes/auth.js';
 import AIService from './services/ai-service.js';
 import { startTursoSync, importFromTurso } from './services/turso-sync.js';
 import { sanitizeString } from './lib/string-utils.js';
@@ -28,7 +30,11 @@ import {
 
 // 全局捕获，排查进程退出原因
 process.on('exit', (code) => {
-  console.error(`⚠️ 进程即将退出，exit code=${code}`);
+  const shouldLogExit =
+    process.env.LOG_PROCESS_EXIT === 'true' || process.env.DEBUG_PROCESS_EXIT === 'true';
+  if (shouldLogExit) {
+    console.error(`⚠️ 进程即将退出，exit code=${code}`);
+  }
 });
 process.on('uncaughtException', (err) => {
   console.error('❌ 未捕获异常导致进程退出:', err);
@@ -55,7 +61,8 @@ const envPaths = [
 let envLoaded = false;
 for (const envPath of envPaths) {
   try {
-    const result = dotenv.config({ path: envPath, override: true });
+    // 不覆盖外部传入的环境变量（例如 `PORT=3002 npm run dev`）
+    const result = dotenv.config({ path: envPath, override: false });
     if (!result.error) {
       console.log(`✅ 已加载环境变量: ${envPath}`);
       envLoaded = true;
@@ -73,9 +80,33 @@ if (!envLoaded) {
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+let httpServer = null;
+
+const buildCorsOptions = () => {
+  const isProd = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
+  const configuredOrigins = String(process.env.CORS_ORIGINS || process.env.APP_BASE_URL || '')
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean);
+  const allowedOrigins = new Set([
+    ...configuredOrigins,
+    'http://localhost:5173',
+    'http://127.0.0.1:5173'
+  ]);
+
+  return {
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.has(origin)) return callback(null, true);
+      if (!isProd && /^https?:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) return callback(null, true);
+      return callback(null, false);
+    },
+    credentials: true
+  };
+};
 
 // 中间件
-app.use(cors());
+app.use(cors(buildCorsOptions()));
 // 捕获原始请求体，便于在 body 解析失败时兜底解析
 app.use(express.json({
   limit: '50mb',
@@ -842,17 +873,6 @@ app.get('/api/health', (_req, res) => {
 });
 
 // 获取笔记本列表
-// 健康检查端点（快速响应，不依赖数据库）
-app.get('/api/health', (_req, res) => {
-  res.json({ 
-    success: true, 
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    dbConnected: !!db
-  });
-});
-
-// 获取笔记本列表
 app.get('/api/notebooks', async (_req, res) => {
   try {
     if (!db) {
@@ -1218,17 +1238,22 @@ app.post('/api/notes', async (req, res) => {
       });
     }
 
-  const {
-    notebook_id,
-    title,
-    content_text,
-    component_data,
-    component_instances,
-    source_url,
-    skipAI = false,
-    parseFields
-  } = req.body || {};
-  const notebookId = sanitizeString(notebook_id);
+    const {
+      notebook_id,
+      title,
+      content_text,
+      component_data,
+      component_instances,
+      source_url,
+      source,
+      original_url,
+      author,
+      upload_time,
+      source_type,
+      skipAI = false,
+      parseFields
+    } = req.body || {};
+    const notebookId = sanitizeString(notebook_id);
 
     if (!notebookId) {
       return res.status(400).json({ success: false, message: '请提供 notebook_id' });
@@ -1245,8 +1270,45 @@ app.post('/api/notes', async (req, res) => {
       return res.status(400).json({ success: false, message: '请至少提供标题或内容' });
     }
 
-  const noteId = generateNoteId();
-  const now = new Date().toISOString();
+    const normalizeSourceType = (value) => {
+      const normalized = sanitizeString(value).toLowerCase();
+      if (normalized === 'link' || normalized === 'manual') return normalized;
+      return null;
+    };
+
+    const parsedComponentData =
+      component_data && typeof component_data === 'object' && !Array.isArray(component_data)
+        ? { ...component_data }
+        : component_data && typeof component_data === 'string'
+          ? (() => {
+              try {
+                const parsed = JSON.parse(component_data);
+                return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? { ...parsed } : {};
+              } catch {
+                return {};
+              }
+            })()
+          : {};
+
+    const resolvedSourceUrl = sanitizeString(source_url) || null;
+    const resolvedSourceType =
+      normalizeSourceType(source_type) ||
+      normalizeSourceType(parsedComponentData?.note_meta?.value?.sourceType) ||
+      (resolvedSourceUrl ? 'link' : 'manual');
+
+    if (!parsedComponentData.note_meta || typeof parsedComponentData.note_meta !== 'object') {
+      parsedComponentData.note_meta = { type: 'meta', title: 'note_meta', value: {} };
+    }
+    if (!parsedComponentData.note_meta.value || typeof parsedComponentData.note_meta.value !== 'object') {
+      parsedComponentData.note_meta.value = {};
+    }
+    parsedComponentData.note_meta.value = {
+      ...(parsedComponentData.note_meta.value || {}),
+      sourceType: resolvedSourceType
+    };
+
+    const noteId = generateNoteId();
+    const now = new Date().toISOString();
 
     await db.run(
       `
@@ -1276,12 +1338,12 @@ app.post('/api/notes', async (req, res) => {
         resolvedContent,
         null,
         null,
-        sanitizeString(source_url) || null,
+        resolvedSourceUrl,
         sanitizeString(source) || null,
         sanitizeString(original_url) || null,
         sanitizeString(author) || null,
         sanitizeString(upload_time) || null,
-        component_data ? JSON.stringify(component_data) : null,
+        Object.keys(parsedComponentData || {}).length ? JSON.stringify(parsedComponentData) : null,
         component_instances ? JSON.stringify(component_instances) : null,
         now,
         now
@@ -1296,14 +1358,6 @@ app.post('/api/notes', async (req, res) => {
   const wantKeywords = normalizedParseFields.includes('keywords');
   const wantAI = !skipAI && (wantSummary || wantKeywords);
 
-  const parsedComponentData =
-    component_data && typeof component_data === 'object'
-      ? component_data
-      : component_data && typeof component_data === 'string'
-        ? (() => {
-            try { return JSON.parse(component_data); } catch { return {}; }
-          })()
-        : {};
   const parsedComponentInstances = Array.isArray(component_instances) ? component_instances : [];
 
   const hasUserSummary = Object.values(parsedComponentData || {}).some((entry) => {
@@ -1367,7 +1421,8 @@ app.post('/api/notes', async (req, res) => {
       title: resolvedTitle,
       content_text: resolvedContent,
       source_url: sanitizeString(source_url) || null,
-      component_data: component_data || null,
+      source_type: resolvedSourceType,
+      component_data: Object.keys(parsedComponentData || {}).length ? parsedComponentData : null,
       component_instances: component_instances || null,
       status: 'success',
       created_at: now,
@@ -1397,6 +1452,85 @@ app.post('/api/note-rename', async (req, res) => {
   } catch (error) {
     console.error('❌ 重命名笔记失败:', error);
     res.status(500).json({ success: false, message: error.message || '重命名笔记失败' });
+  }
+});
+
+// 更新笔记标题/正文（飞书式编辑器：自动保存）
+app.put('/api/notes/:id/content', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: '数据库未连接' });
+    }
+
+    const noteId = sanitizeString(req.params?.id);
+    if (!noteId) {
+      return res.status(400).json({ success: false, error: '请提供笔记ID' });
+    }
+
+    const nextTitle = sanitizeString(req.body?.title, '') || '';
+    const nextContentText = sanitizeString(req.body?.content_text, '') || '';
+    const nextContentHtml = typeof req.body?.content_html === 'string' ? req.body.content_html : '';
+    const nextImgUrlsRaw = req.body?.img_urls ?? req.body?.imgUrls ?? null;
+    const nextImgUrls = Array.isArray(nextImgUrlsRaw)
+      ? nextImgUrlsRaw.map((u) => sanitizeString(u, '')).filter(Boolean)
+      : typeof nextImgUrlsRaw === 'string'
+        ? nextImgUrlsRaw
+          .split(/[\n,]/)
+          .map((u) => sanitizeString(u, '')).filter(Boolean)
+        : [];
+
+    if (!nextTitle.trim() && !nextContentText.trim() && !nextContentHtml.trim()) {
+      return res.status(400).json({ success: false, error: '内容不能为空' });
+    }
+
+    const existing = await db.get(`SELECT ${NOTE_FIELDS} FROM notes WHERE note_id = ?`, [noteId]);
+    if (!existing) {
+      return res.status(404).json({ success: false, error: '笔记不存在' });
+    }
+
+    const parsedComponentData = safeJsonParse(existing.component_data, {}) || {};
+    if (!parsedComponentData.note_meta || typeof parsedComponentData.note_meta !== 'object') {
+      parsedComponentData.note_meta = { type: 'meta', title: 'note_meta', value: {} };
+    }
+    if (!parsedComponentData.note_meta.value || typeof parsedComponentData.note_meta.value !== 'object') {
+      parsedComponentData.note_meta.value = {};
+    }
+    if (nextContentHtml && nextContentHtml.trim()) {
+      parsedComponentData.note_meta.value.contentHtml = nextContentHtml;
+    }
+    if (nextImgUrls.length > 0) {
+      parsedComponentData.note_meta.value.imgUrls = nextImgUrls;
+    }
+
+    const now = new Date().toISOString();
+    const finalTitle = nextTitle.trim() ? nextTitle.trim() : sanitizeString(existing.title, '未命名笔记') || '未命名笔记';
+    const finalText = nextContentText.trim() ? nextContentText : sanitizeString(existing.content_text, '') || '';
+    const finalImageUrls =
+      nextImgUrls.length > 0
+        ? nextImgUrls.join('\n')
+        : typeof existing.image_urls === 'string'
+          ? sanitizeString(existing.image_urls, '')
+          : '';
+
+    await db.run(
+      'UPDATE notes SET title = ?, content_text = ?, image_urls = ?, component_data = ?, updated_at = ? WHERE note_id = ?',
+      [finalTitle, finalText, finalImageUrls, JSON.stringify(parsedComponentData), now, noteId]
+    );
+
+    return res.json({
+      success: true,
+      note: {
+        note_id: noteId,
+        title: finalTitle,
+        content_text: finalText,
+        image_urls: finalImageUrls,
+        component_data: parsedComponentData,
+        updated_at: now
+      }
+    });
+  } catch (error) {
+    console.error('❌ 更新笔记内容失败:', error);
+    return res.status(500).json({ success: false, error: error?.message || '更新笔记内容失败' });
   }
 });
 
@@ -3470,7 +3604,22 @@ async function startServer() {
       } else {
         console.log('ℹ️ 未开启 Turso 同步，运行纯本地模式');
       }
-    }
+	    }
+
+    // 注册认证路由（邮箱验证 / 找回密码 / Google & 微信登录）
+    const authRouter = initAuthRoutes(db);
+    app.use('/', authRouter);
+    console.log('🔐 认证接口已启用:');
+    console.log('  - GET /api/auth/me');
+    console.log('  - POST /api/auth/register');
+    console.log('  - POST /api/auth/login');
+    console.log('  - POST /api/auth/logout');
+    console.log('  - POST /api/auth/email/resend');
+    console.log('  - POST /api/auth/verify-email');
+    console.log('  - POST /api/auth/password/request');
+    console.log('  - POST /api/auth/password/reset');
+    console.log('  - GET /api/auth/oauth/google');
+    console.log('  - GET /api/auth/oauth/wechat');
 
     // 注册解析路由
     const parseRouter = initParseRoutes(db);
@@ -3480,8 +3629,12 @@ async function startServer() {
     const aiChartRouter = initAIChartV3Routes({ aiService });
     app.use('/', aiChartRouter);
 
+    // 注册分析 V3 主流程
+    const analysisV3Router = initAnalysisV3Routes({ db, aiService });
+    app.use('/', analysisV3Router);
+
     // 启动服务器
-    app.listen(PORT, () => {
+    httpServer = app.listen(PORT, () => {
       console.log(`[backend] listening on http://localhost:${PORT}`);
       console.log('📝 解析接口已启用:');
       console.log('  - POST /api/coze/parse-article');
@@ -3498,6 +3651,24 @@ async function startServer() {
       console.log('  - POST /api/ai-chart/recommend');
       console.log('  - POST /api/ai-chart/rerank');
       console.log('  - POST /api/ai-chart/derive-fields');
+      console.log('🧠 分析 V3 已启用:');
+      console.log('  - POST /api/analysis/v3');
+      console.log('  - GET /api/analysis/v3/:analysisId/debug');
+    });
+
+    httpServer.on('error', (err) => {
+      console.error('❌ HTTP server error:', err);
+      if (err?.code === 'EADDRINUSE') {
+        console.error(
+          `❌ 端口被占用：${PORT}。可尝试：\n` +
+            `  1) 结束占用端口的进程，或\n` +
+            `  2) 改用其他端口，例如：PORT=3002 npm run dev，或修改 .env.local 里的 PORT`
+        );
+      }
+      process.exit(1);
+    });
+    httpServer.on('close', () => {
+      console.warn('⚠️ HTTP server closed');
     });
   } catch (error) {
     console.error('❌ 服务器启动失败:', error);

@@ -71,6 +71,63 @@ const CREATE_AI_FIELD_VALUES_TABLE_SQL = `
   )
 `;
 
+const CREATE_AUTH_USERS_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS auth_users (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    name TEXT,
+    password_hash TEXT,
+    email_verified INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    last_login_at TEXT
+  )
+`;
+
+const CREATE_AUTH_OAUTH_ACCOUNTS_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS auth_oauth_accounts (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_user_id TEXT NOT NULL,
+    provider_email TEXT,
+    provider_name TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(provider, provider_user_id),
+    FOREIGN KEY (user_id) REFERENCES auth_users(id)
+  )
+`;
+
+const CREATE_AUTH_SESSIONS_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS auth_sessions (
+    id TEXT PRIMARY KEY,
+    session_hash TEXT NOT NULL UNIQUE,
+    user_id TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    expires_at TEXT NOT NULL,
+    last_seen_at TEXT,
+    ip TEXT,
+    user_agent TEXT,
+    revoked_at TEXT,
+    FOREIGN KEY (user_id) REFERENCES auth_users(id)
+  )
+`;
+
+const CREATE_AUTH_TOKENS_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS auth_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    type TEXT NOT NULL, -- email_verify | password_reset
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    meta TEXT,
+    FOREIGN KEY (user_id) REFERENCES auth_users(id)
+  )
+`;
+
 /**
  * 初始化数据库连接
  * @returns {Promise<object>} 数据库实例 { primary: 本地数据库, tursoClient: Turso客户端 }
@@ -367,6 +424,11 @@ async function initializeTables(db) {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
   `;
+
+  const createAuthUsersTable = CREATE_AUTH_USERS_TABLE_SQL;
+  const createAuthOauthAccountsTable = CREATE_AUTH_OAUTH_ACCOUNTS_TABLE_SQL;
+  const createAuthSessionsTable = CREATE_AUTH_SESSIONS_TABLE_SQL;
+  const createAuthTokensTable = CREATE_AUTH_TOKENS_TABLE_SQL;
   
   try {
     // 使用重试机制执行表创建
@@ -405,6 +467,10 @@ async function initializeTables(db) {
     await executeWithRetry(createFieldTemplatePreferenceTable);
     await executeWithRetry(createAiFieldDefinitionsTable);
     await executeWithRetry(createAiFieldValuesTable);
+    await executeWithRetry(createAuthUsersTable);
+    await executeWithRetry(createAuthOauthAccountsTable);
+    await executeWithRetry(createAuthSessionsTable);
+    await executeWithRetry(createAuthTokensTable);
     
     // 创建索引以优化查询性能
     const createIndexes = [
@@ -426,7 +492,12 @@ async function initializeTables(db) {
       `CREATE INDEX IF NOT EXISTS idx_field_template_source ON notebook_field_templates(source_type)`,
       `CREATE INDEX IF NOT EXISTS idx_ai_field_def_notebook_key ON ai_field_definitions(notebook_id, field_key)`,
       `CREATE INDEX IF NOT EXISTS idx_ai_field_values_field_note ON ai_field_values(field_def_id, note_id)`,
-      `CREATE INDEX IF NOT EXISTS idx_ai_field_values_note ON ai_field_values(note_id)`
+      `CREATE INDEX IF NOT EXISTS idx_ai_field_values_note ON ai_field_values(note_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_auth_users_email ON auth_users(email)`,
+      `CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)`,
+      `CREATE INDEX IF NOT EXISTS idx_auth_tokens_user_type ON auth_tokens(user_id, type)`,
+      `CREATE INDEX IF NOT EXISTS idx_auth_oauth_user ON auth_oauth_accounts(user_id)`
     ];
     
     for (const indexSql of createIndexes) {
@@ -544,6 +615,10 @@ function initializeTablesSync(db) {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
   `;
+  const createAuthUsersTable = CREATE_AUTH_USERS_TABLE_SQL;
+  const createAuthOauthAccountsTable = CREATE_AUTH_OAUTH_ACCOUNTS_TABLE_SQL;
+  const createAuthSessionsTable = CREATE_AUTH_SESSIONS_TABLE_SQL;
+  const createAuthTokensTable = CREATE_AUTH_TOKENS_TABLE_SQL;
   
   try {
     db.exec(createParseHistoryTable);
@@ -555,6 +630,10 @@ function initializeTablesSync(db) {
     db.exec(createFieldTemplatePreferenceTable);
     db.exec(createAiFieldDefinitionsTable);
     db.exec(createAiFieldValuesTable);
+    db.exec(createAuthUsersTable);
+    db.exec(createAuthOauthAccountsTable);
+    db.exec(createAuthSessionsTable);
+    db.exec(createAuthTokensTable);
     
     // 创建索引以优化查询性能
     const createIndexes = [
@@ -576,7 +655,12 @@ function initializeTablesSync(db) {
       `CREATE INDEX IF NOT EXISTS idx_field_template_source ON notebook_field_templates(source_type)`,
       `CREATE INDEX IF NOT EXISTS idx_ai_field_def_notebook_key ON ai_field_definitions(notebook_id, field_key)`,
       `CREATE INDEX IF NOT EXISTS idx_ai_field_values_field_note ON ai_field_values(field_def_id, note_id)`,
-      `CREATE INDEX IF NOT EXISTS idx_ai_field_values_note ON ai_field_values(note_id)`
+      `CREATE INDEX IF NOT EXISTS idx_ai_field_values_note ON ai_field_values(note_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_auth_users_email ON auth_users(email)`,
+      `CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)`,
+      `CREATE INDEX IF NOT EXISTS idx_auth_tokens_user_type ON auth_tokens(user_id, type)`,
+      `CREATE INDEX IF NOT EXISTS idx_auth_oauth_user ON auth_oauth_accounts(user_id)`
     ];
     
     for (const indexSql of createIndexes) {

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { useLocation } from 'react-router-dom';
 import apiClient, { type Notebook, type Note } from '../apiClient';
 import { getDisplayTitle } from '../utils/displayTitle';
@@ -10,23 +11,117 @@ type ChatMessage = {
   content: string;
 };
 
-const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
+type ChatSession = {
+  id: string;
+  notebookId: string;
+  title: string;
+  messages: ChatMessage[];
+  createdAt: number;
+  updatedAt: number;
+};
+
+const CHAT_HISTORY_STORAGE_KEY = 'notebookAssistant.chatHistory.v1';
+const CHAT_HISTORY_MAX_SESSIONS = 30;
+const CHAT_HISTORY_MAX_MESSAGES = 200;
+const CHAT_CONTEXT_WINDOW = 60;
+const CHAT_MESSAGE_MAX_CHARS = 4000;
+
+type NotebookAssistantPageProps = {
+  notebookId: string;
+  notebooks: Notebook[];
+  notebooksLoading?: boolean;
+  onRequestNotebookRefresh?: () => void;
+};
+
+const clampText = (value: string, max: number) => {
+  const text = String(value || '');
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}…`;
+};
+
+const normalizeChatMessages = (messages: ChatMessage[]): ChatMessage[] =>
+  (messages || []).map(
+    (msg): ChatMessage => ({
+      role: msg.role === 'user' ? 'user' : 'assistant',
+      content: clampText(msg.content || '', CHAT_MESSAGE_MAX_CHARS)
+    })
+  );
+
+const HistoryIcon = ({ className }: { className?: string }) => (
+  <svg
+    viewBox="0 0 1024 1024"
+    className={className}
+    xmlns="http://www.w3.org/2000/svg"
+    aria-hidden="true"
+    focusable="false"
+  >
+    <path
+      d="M798.5152 707.9936v-77.0048c0-12.288-9.8304-22.7328-22.1184-22.7328-13.9264 0-24.1664 11.4688-24.1664 25.3952V739.328c0 8.192 6.7584 14.9504 14.9504 14.9504h83.5584c13.1072 0 24.1664-10.6496 23.7568-23.7568-0.4096-13.7216-11.6736-22.528-25.3952-22.528h-50.5856z m-502.3744-119.1936c-16.384 0-29.2864 13.9264-27.8528 30.5152 1.2288 14.5408 13.9264 25.3952 28.672 25.3952h142.9504c14.5408 0 27.2384-10.8544 28.672-25.3952 1.4336-16.5888-11.4688-30.5152-27.8528-30.5152h-144.5888z m0-231.6288h309.4528c15.7696 0 28.4672-12.9024 28.0576-28.8768-0.4096-14.9504-13.7216-27.2384-28.672-27.2384H296.7552c-14.7456 0-27.8528 11.8784-28.672 26.624-0.4096 7.9872 2.6624 15.5648 8.192 21.2992 5.3248 5.12 12.288 8.192 19.8656 8.192z m241.4592 113.0496c0-15.36-12.4928-28.0576-28.0576-28.0576H296.7552c-14.5408 0-27.2384 10.8544-28.4672 25.3952-1.4336 16.5888 11.6736 30.5152 28.0576 30.5152h213.4016c15.36 0.4096 27.8528-12.288 27.8528-27.8528z m0 0"
+      fill="#515151"
+    />
+    <path
+      d="M568.5248 846.4384H248.0128c-24.1664 0-44.032-19.8656-44.032-44.032V212.1728c0-24.1664 19.8656-44.032 44.032-44.032h461.0048c24.1664 0 44.032 19.8656 44.032 44.032v223.0272c0 15.5648 11.6736 28.8768 27.0336 30.3104 17.6128 1.6384 32.3584-12.288 32.3584-29.696V212.1728c0-57.1392-46.4896-103.6288-103.424-103.6288H248.0128c-55.296 0-100.5568 43.008-103.424 98.0992v601.4976c2.8672 54.8864 48.3328 97.8944 103.424 97.8944h319.8976c14.9504 0 28.0576-10.6496 30.1056-25.3952 2.6624-18.432-11.6736-34.2016-29.4912-34.2016z m0 0"
+      fill="#515151"
+    />
+    <path
+      d="M782.7456 502.1696c-111.8208 0-202.752 91.3408-201.9328 203.5712 0.8192 109.7728 90.5216 199.4752 200.4992 200.4992 112.0256 0.8192 203.5712-90.112 203.5712-201.9328-0.2048-111.616-90.7264-202.1376-202.1376-202.1376z m146.432 201.9328c0 81.5104-66.7648 147.456-148.48 146.432-78.848-1.024-143.1552-65.3312-144.384-143.9744-1.2288-81.92 64.9216-148.8896 146.432-148.8896 80.6912 0 146.432 65.536 146.432 146.432z m0 0"
+      fill="#515151"
+    />
+  </svg>
+);
+
+const TrashIcon = ({ className }: { className?: string }) => (
+  <svg
+    viewBox="0 0 24 24"
+    className={className}
+    xmlns="http://www.w3.org/2000/svg"
+    aria-hidden="true"
+    focusable="false"
+  >
+    <path
+      d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 7h2v9h-2v-9zm4 0h2v9h-2v-9zM6 7h12l-1 14H7L6 7z"
+      fill="currentColor"
+    />
+  </svg>
+);
+
+const NotebookAssistantPage = ({
+  notebookId,
+  notebooks,
+  notebooksLoading
+}: NotebookAssistantPageProps) => {
   const location = useLocation();
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [notebooks, setNotebooks] = useState<Notebook[]>([]);
+  const [copiedMessageKey, setCopiedMessageKey] = useState<string | null>(null);
+  const copiedTimerRef = useRef<number | null>(null);
   const [notes, setNotes] = useState<Note[]>([]);
   // 空字符串表示“跟随当前笔记本”，下拉展示为「选择笔记本」
   const [selectedNotebookId, setSelectedNotebookId] = useState<string>('');
   const [selectedNoteIds, setSelectedNoteIds] = useState<string[]>([]);
-  const [loadingNotebooks, setLoadingNotebooks] = useState(false);
   const [loadingNotes, setLoadingNotes] = useState(false);
   const [notebookDropdownOpen, setNotebookDropdownOpen] = useState(false);
   const [selectionPanelOpen, setSelectionPanelOpen] = useState(false);
+  const [historyPanelOpen, setHistoryPanelOpen] = useState(false);
+  const [chatHistory, setChatHistory] = useState<ChatSession[]>([]);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const currentSessionIdRef = useRef<string | null>(null);
+  const [historyPopoverStyle, setHistoryPopoverStyle] = useState<{
+    top: number;
+    left: number;
+    width: number;
+  } | null>(null);
+  const historyLoadedRef = useRef(false);
+  const chatHistoryRef = useRef<ChatSession[]>([]);
+  const lastHydratedNotebookRef = useRef<string>('');
+  const historyButtonRef = useRef<HTMLButtonElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const lastNotebookIdRef = useRef<string>('');
+
+  const loadingNotebooks = Boolean(notebooksLoading);
 
   const { startDate, endDate } = useMemo(() => {
     const params = new URLSearchParams(location.search);
@@ -40,6 +135,168 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
     return `${startDate} 至 ${endDate}`;
   }, [startDate, endDate]);
 
+  const effectiveNotebookId = useMemo(
+    () => selectedNotebookId || notebookId || '',
+    [selectedNotebookId, notebookId]
+  );
+
+  const getSessionTitle = (messages: ChatMessage[]) => {
+    const firstUserMessage = messages.find((msg) => msg.role === 'user')?.content?.trim();
+    if (firstUserMessage) return clampText(firstUserMessage, 24);
+    return '未命名对话';
+  };
+
+  const loadChatHistory = () => {
+    if (typeof window === 'undefined') return [] as ChatSession[];
+    try {
+      const raw = window.localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter((item) => item && typeof item === 'object')
+        .map((item) => {
+          const messages: ChatMessage[] = Array.isArray((item as any).messages)
+            ? (item as any).messages
+                .filter((msg: any) => msg && typeof msg === 'object')
+                .map(
+                  (msg: any) =>
+                    ({
+                      role: msg.role === 'user' ? 'user' : 'assistant',
+                      content: String(msg.content || '')
+                    }) as ChatMessage
+                )
+            : [];
+          const normalizedMessages = normalizeChatMessages(messages).slice(
+            -CHAT_HISTORY_MAX_MESSAGES
+          );
+          const title =
+            clampText(String((item as any).title || ''), 60) || getSessionTitle(normalizedMessages);
+          return {
+            id: String((item as any).id || ''),
+            notebookId: String((item as any).notebookId || ''),
+            title,
+            messages: normalizedMessages,
+            createdAt: Number((item as any).createdAt || Date.now()),
+            updatedAt: Number((item as any).updatedAt || Date.now())
+          } as ChatSession;
+        })
+        .filter((session) => Boolean(session.id) && Boolean(session.notebookId))
+        .slice(0, CHAT_HISTORY_MAX_SESSIONS);
+    } catch {
+      return [];
+    }
+  };
+
+  const normalizeHistoryForStorage = (history: ChatSession[]) => {
+    const now = Date.now();
+    return (history || [])
+      .filter((item) => item && typeof item === 'object')
+      .map((item) => {
+        const normalizedMessages = normalizeChatMessages(item.messages || []).slice(
+          -CHAT_HISTORY_MAX_MESSAGES
+        );
+        const title =
+          clampText(String(item.title || ''), 60) || getSessionTitle(normalizedMessages);
+        return {
+          id: String(item.id || ''),
+          notebookId: String(item.notebookId || ''),
+          title,
+          messages: normalizedMessages,
+          createdAt: Number(item.createdAt || now),
+          updatedAt: Number(item.updatedAt || now)
+        } as ChatSession;
+      })
+      .filter((session) => Boolean(session.id) && Boolean(session.notebookId))
+      .slice(0, CHAT_HISTORY_MAX_SESSIONS);
+  };
+
+  const saveChatHistory = (history: ChatSession[]) => {
+    if (typeof window === 'undefined') return;
+    const normalized = normalizeHistoryForStorage(history);
+    try {
+      window.localStorage.setItem(CHAT_HISTORY_STORAGE_KEY, JSON.stringify(normalized));
+    } catch (error) {
+      try {
+        const compact = normalized.slice(0, 10).map((session) => ({
+          ...session,
+          messages: session.messages.slice(-50)
+        }));
+        window.localStorage.setItem(CHAT_HISTORY_STORAGE_KEY, JSON.stringify(compact));
+      } catch {
+        console.warn('保存对话历史失败:', error);
+      }
+    }
+  };
+
+  const generateSessionId = () => {
+    const cryptoObj = typeof crypto !== 'undefined' ? crypto : null;
+    if (cryptoObj && typeof (cryptoObj as any).randomUUID === 'function') {
+      return (cryptoObj as any).randomUUID();
+    }
+    return `sess_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  };
+
+  const ensureSessionId = () => {
+    if (currentSessionId) return currentSessionId;
+    const nextId = generateSessionId();
+    setCurrentSessionId(nextId);
+    currentSessionIdRef.current = nextId;
+    return nextId;
+  };
+
+  useEffect(() => {
+    const history = loadChatHistory();
+    setChatHistory(history);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    currentSessionIdRef.current = currentSessionId;
+  }, [currentSessionId]);
+
+  useEffect(() => {
+    if (!historyLoadedRef.current) {
+      historyLoadedRef.current = true;
+      return;
+    }
+    saveChatHistory(chatHistory);
+  }, [chatHistory]);
+
+  useEffect(() => {
+    chatHistoryRef.current = chatHistory;
+  }, [chatHistory]);
+
+  useEffect(() => {
+    return () => {
+      if (!historyLoadedRef.current) return;
+      saveChatHistory(chatHistoryRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!historyLoadedRef.current) return;
+    if (!effectiveNotebookId) return;
+    if (chatMessages.length > 0 || currentSessionId) {
+      lastHydratedNotebookRef.current = effectiveNotebookId;
+      return;
+    }
+    if (lastHydratedNotebookRef.current === effectiveNotebookId) return;
+
+    const sessions = chatHistory.filter((session) => session.notebookId === effectiveNotebookId);
+    if (sessions.length === 0) return;
+
+    const latest = sessions.reduce((acc, session) =>
+      (session.updatedAt || 0) >= (acc.updatedAt || 0) ? session : acc
+    );
+    if (!latest?.id) return;
+
+    lastHydratedNotebookRef.current = effectiveNotebookId;
+    setCurrentSessionId(latest.id);
+    setChatMessages(latest.messages || []);
+  }, [chatHistory, chatMessages.length, currentSessionId, effectiveNotebookId]);
+
   useEffect(() => {
     requestAnimationFrame(() => {
       if (scrollRef.current) {
@@ -48,37 +305,116 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
     });
   }, [chatMessages.length]);
 
-  // 同步外部 notebookId 变更
-  // 加载笔记本列表
   useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        setLoadingNotebooks(true);
-        const list = await apiClient.getNotebooks();
-        if (cancelled) return;
-        setNotebooks(list);
-      } catch (error) {
-        console.error('加载笔记本失败:', error);
-      } finally {
-        if (!cancelled) {
-          setLoadingNotebooks(false);
-        }
+    if (!historyPanelOpen) {
+      setHistoryPopoverStyle(null);
+      return;
+    }
+    if (typeof window === 'undefined') return;
+
+    let rafId: number | null = null;
+
+    const updatePosition = () => {
+      const anchor = historyButtonRef.current;
+      if (!anchor) return;
+      const rect = anchor.getBoundingClientRect();
+      const margin = 16;
+      const gap = 10;
+      const maxWidth = 920;
+      const width = Math.min(maxWidth, Math.max(360, window.innerWidth - margin * 2));
+      const top = Math.min(rect.bottom + gap, window.innerHeight - margin);
+      const left = Math.min(
+        Math.max(rect.right - width, margin),
+        Math.max(margin, window.innerWidth - width - margin)
+      );
+      setHistoryPopoverStyle((prev) => {
+        if (prev && prev.top === top && prev.left === left && prev.width === width) return prev;
+        return { top, left, width };
+      });
+    };
+
+    const scheduleUpdate = () => {
+      if (rafId !== null) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        updatePosition();
+      });
+    };
+
+    scheduleUpdate();
+    window.addEventListener('resize', scheduleUpdate);
+    window.addEventListener('scroll', scheduleUpdate, true);
+    return () => {
+      window.removeEventListener('resize', scheduleUpdate);
+      window.removeEventListener('scroll', scheduleUpdate, true);
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+        rafId = null;
       }
     };
-    load();
-    return () => {
-      cancelled = true;
+  }, [historyPanelOpen]);
+
+  useEffect(() => {
+    const sessionId = currentSessionId || currentSessionIdRef.current;
+    if (!sessionId) return;
+    if (!effectiveNotebookId) return;
+    if (chatMessages.length === 0) return;
+    const now = Date.now();
+    const title = getSessionTitle(chatMessages);
+    const session: ChatSession = {
+      id: sessionId,
+      notebookId: effectiveNotebookId,
+      title,
+      messages: chatMessages.slice(-CHAT_HISTORY_MAX_MESSAGES),
+      createdAt: now,
+      updatedAt: now
     };
-    // 只在首次挂载时加载列表
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setChatHistory((prev) => {
+      const existing = prev.find((item) => item.id === sessionId);
+      const createdAt = existing?.createdAt ?? now;
+      const nextSession = { ...session, createdAt };
+      const next = prev.filter((item) => item.id !== sessionId);
+      next.unshift(nextSession);
+      return next.slice(0, CHAT_HISTORY_MAX_SESSIONS);
+    });
+  }, [chatMessages, currentSessionId, effectiveNotebookId]);
+
+  useEffect(() => {
+    return () => {
+      if (copiedTimerRef.current) {
+        window.clearTimeout(copiedTimerRef.current);
+        copiedTimerRef.current = null;
+      }
+    };
   }, []);
+
+  useEffect(() => {
+    const last = lastNotebookIdRef.current;
+    if (!effectiveNotebookId) {
+      lastNotebookIdRef.current = '';
+      return;
+    }
+    if (!last) {
+      lastNotebookIdRef.current = effectiveNotebookId;
+      return;
+    }
+    if (last === effectiveNotebookId) return;
+
+    lastNotebookIdRef.current = effectiveNotebookId;
+    setCurrentSessionId(null);
+    currentSessionIdRef.current = null;
+    setChatMessages([]);
+    setChatInput('');
+    setSelectedNoteIds([]);
+    setSelectionPanelOpen(false);
+    setHistoryPanelOpen(false);
+    setNotebookDropdownOpen(false);
+  }, [effectiveNotebookId]);
 
   // 加载选中笔记本下的笔记列表
   useEffect(() => {
     let cancelled = false;
     const loadNotes = async () => {
-      const effectiveNotebookId = selectedNotebookId || notebookId;
       if (!effectiveNotebookId) {
         setNotes([]);
         setSelectedNoteIds([]);
@@ -107,17 +443,51 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
     return () => {
       cancelled = true;
     };
-  }, [selectedNotebookId]);
+  }, [effectiveNotebookId]);
 
   const handleBackToHome = () => {
     setChatMessages([]);
     setChatInput('');
+    setCurrentSessionId(null);
+  };
+
+  const copyToClipboard = async (text: string, messageKey: string) => {
+    const payload = String(text || '');
+    if (!payload) return;
+
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(payload);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = payload;
+        textarea.setAttribute('readonly', 'true');
+        textarea.style.position = 'fixed';
+        textarea.style.left = '-9999px';
+        textarea.style.top = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+      }
+
+      setCopiedMessageKey(messageKey);
+      if (copiedTimerRef.current) {
+        window.clearTimeout(copiedTimerRef.current);
+      }
+      copiedTimerRef.current = window.setTimeout(() => {
+        setCopiedMessageKey(null);
+        copiedTimerRef.current = null;
+      }, 1200);
+    } catch (err) {
+      console.warn('复制失败:', err);
+    }
   };
 
   const sendMessage = async (content: string) => {
     const trimmed = content.trim();
     if (!trimmed || loading) return;
-    const targetNotebookId = selectedNotebookId || notebookId;
+    const targetNotebookId = effectiveNotebookId;
     if (!targetNotebookId) {
       setChatMessages((prev) => [
         ...prev,
@@ -126,6 +496,7 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
       return;
     }
 
+    ensureSessionId();
     const nextMessages: ChatMessage[] = [
       ...chatMessages,
       { role: 'user', content: trimmed }
@@ -134,10 +505,13 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
     setChatMessages(nextMessages);
     setChatInput('');
     setLoading(true);
+    setSelectionPanelOpen(false);
+    setNotebookDropdownOpen(false);
+    setHistoryPanelOpen(false);
 
     try {
       const payload: any = {
-        messages: nextMessages,
+        messages: nextMessages.slice(-CHAT_CONTEXT_WINDOW),
         startDate,
         endDate
       };
@@ -249,8 +623,8 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
   };
 
   const canSend = useMemo(
-    () => Boolean(chatInput.trim() || selectedNoteIds.length > 0),
-    [chatInput, selectedNoteIds.length]
+    () => Boolean(chatInput.trim()),
+    [chatInput]
   );
 
   const quickActionCount = quickActions.length || 1;
@@ -263,21 +637,19 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
   };
 
   const handleFilesSelected = (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.target.files || []);
+    const input = event.target;
+    const files = Array.from(input.files || []);
+    input.value = '';
     if (!files.length) return;
     // 这里先只触发选择文件操作，后续如需上传可在此扩展
-    console.log('Selected attachment files:', files);
   };
 
   const renderMainInput = (variant: 'hero' | 'inline') => {
-    const containerClasses =
-      variant === 'hero'
-        ? 'mt-6 w-full max-w-3xl mx-auto'
-        : 'w-full max-w-3xl';
+    const containerClasses = 'w-full';
     const sendButtonSize = 'h-[35px] w-[35px]';
 
     return (
-      <div className={containerClasses}>
+      <div className={containerClasses} data-variant={variant}>
         <div className="rounded-2xl border border-gray-100 bg-white px-5 py-3 shadow-[0_18px_40px_rgba(10,34,61,0.04)]">
           <div className="flex items-end gap-3">
             <div className="relative flex-1">
@@ -347,7 +719,10 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
         <div className="mt-3 flex items-center justify-end text-[11px] text-slate-600">
           <button
             type="button"
-            onClick={() => setSelectionPanelOpen(prev => !prev)}
+            onClick={() => {
+              setSelectionPanelOpen((prev) => !prev);
+              setHistoryPanelOpen(false);
+            }}
             className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
           >
             <span className="truncate max-w-[180px]">
@@ -373,19 +748,18 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
           </button>
         </div>
 
-        {selectionPanelOpen && renderSelectionPanel()}
+        {/* selection panel moved to bottom drawer to avoid squeezing chat area */}
       </div>
     );
   };
 
-  const renderSelectionPanel = () => {
+  const renderSelectionPanelContent = () => {
     const selectedNotebook =
       selectedNotebookId && notebooks.find(nb => nb.notebook_id === selectedNotebookId);
     const notebookLabel = selectedNotebook ? selectedNotebook.name : '选择笔记本';
 
     return (
-      <div className="mt-3">
-        <div className="rounded-2xl border border-[#b5ece0] bg-[#e8f7f3] px-4 py-3 shadow-sm shadow-[#b5ece0]/40">
+      <div className="rounded-2xl border border-[#b5ece0] bg-[#e8f7f3] px-4 py-3 shadow-sm shadow-[#b5ece0]/40">
           <div className="flex flex-wrap items-center gap-3 text-[11px] text-slate-600">
             <div className="flex items-center gap-2">
               <span className="text-slate-500">分析范围</span>
@@ -528,13 +902,177 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
               })}
             </div>
           )}
-        </div>
       </div>
     );
   };
 
+  const renderSelectionDrawer = () => {
+    if (!selectionPanelOpen) return null;
+    return createPortal(
+      <div
+        className="fixed inset-0 z-[1200]"
+        onMouseDown={() => {
+          setSelectionPanelOpen(false);
+          setNotebookDropdownOpen(false);
+        }}
+      >
+        <div className="absolute inset-0 bg-black/10" />
+        <div className="absolute left-0 right-0 bottom-0 px-4 pb-4">
+          <div
+            className="mx-auto w-full max-w-3xl rounded-3xl border border-[#d4f3ed] bg-white shadow-2xl"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-[#eef6fd]">
+              <div className="text-sm font-semibold text-slate-900">选择笔记 / 时间范围</div>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectionPanelOpen(false);
+                  setNotebookDropdownOpen(false);
+                }}
+                className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+              >
+                关闭
+              </button>
+            </div>
+            <div className="px-4 py-4">
+              {renderSelectionPanelContent()}
+            </div>
+          </div>
+        </div>
+      </div>,
+      document.body
+    );
+  };
+
+  const renderHistoryDrawer = () => {
+    if (!historyPanelOpen) return null;
+    const sessions = effectiveNotebookId
+      ? chatHistory.filter((session) => session.notebookId === effectiveNotebookId)
+      : chatHistory;
+
+    const panelStyle = historyPopoverStyle ?? { top: 80, left: 16, width: 720 };
+    const panelMaxHeight = `calc(100vh - ${panelStyle.top}px - 16px)`;
+
+    return createPortal(
+      <div
+        className="fixed inset-0 z-[1300]"
+        onMouseDown={() => {
+          setHistoryPanelOpen(false);
+        }}
+      >
+        <div className="absolute inset-0 bg-transparent" />
+        <div
+          className="absolute px-4"
+          style={{
+            top: panelStyle.top,
+            left: panelStyle.left,
+            width: panelStyle.width
+          }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div
+            className="flex flex-col overflow-hidden rounded-3xl border border-[#d4f3ed] bg-white shadow-2xl"
+            style={{ maxHeight: panelMaxHeight }}
+          >
+            <div className="flex items-center justify-between gap-3 border-b border-[#eef6fd] px-4 py-3">
+              <div className="text-sm font-semibold text-slate-900">对话历史</div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setChatHistory((prev) => {
+                      if (!effectiveNotebookId) return [];
+                      return prev.filter((session) => session.notebookId !== effectiveNotebookId);
+                    });
+                    setCurrentSessionId(null);
+                    setChatMessages([]);
+                    setChatInput('');
+                    setHistoryPanelOpen(false);
+                  }}
+                  className="inline-flex items-center justify-center p-2 text-rose-600 hover:text-rose-700"
+                  title="清空历史"
+                  aria-label="清空历史"
+                >
+                  <TrashIcon className="h-5 w-5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setHistoryPanelOpen(false)}
+                  className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                >
+                  关闭
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-y-auto px-4 py-3">
+              {sessions.length === 0 ? (
+                <div className="py-10 text-center text-sm text-slate-500">暂无对话历史</div>
+              ) : (
+                <div className="space-y-2">
+                  {sessions.map((session) => {
+                    const active = session.id === currentSessionId;
+                    const updatedAtText = new Date(session.updatedAt).toLocaleString();
+                    return (
+                      <div
+                        key={session.id}
+                        className={`flex items-center justify-between gap-3 rounded-2xl border px-3 py-2 ${
+                          active ? 'border-[#6bd8c0] bg-[#e8f7f3]' : 'border-slate-200 bg-white'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setChatMessages(session.messages || []);
+                            setCurrentSessionId(session.id);
+                            setChatInput('');
+                            setHistoryPanelOpen(false);
+                            setSelectionPanelOpen(false);
+                            setNotebookDropdownOpen(false);
+                          }}
+                          className="min-w-0 flex-1 text-left"
+                          title="打开该对话"
+                        >
+                          <div className="truncate text-sm font-medium text-slate-900">
+                            {session.title || '未命名对话'}
+                          </div>
+                          <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
+                            <span>{updatedAtText}</span>
+                            <span>·</span>
+                            <span>{session.messages?.length || 0} 条消息</span>
+                          </div>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setChatHistory((prev) => prev.filter((item) => item.id !== session.id));
+                            if (session.id === currentSessionId) {
+                              setCurrentSessionId(null);
+                              setChatMessages([]);
+                              setChatInput('');
+                            }
+                          }}
+                          className="shrink-0 inline-flex items-center justify-center p-2 text-slate-500 hover:text-rose-600"
+                          title="删除该对话"
+                          aria-label="删除该对话"
+                        >
+                          <TrashIcon className="h-5 w-5" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>,
+      document.body
+    );
+  };
+
   return (
-    <div className="flex h-full w-full flex-col px-4 pb-10">
+    <div className="flex h-full min-h-0 w-full flex-col px-4 pb-4">
       <input
         ref={fileInputRef}
         type="file"
@@ -543,36 +1081,59 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
         onChange={handleFilesSelected}
         className="hidden"
       />
-      {chatMessages.length > 0 && (
-        <div className="px-5 pb-2">
-          <button
-            type="button"
-            onClick={handleBackToHome}
-            className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-medium text-slate-700 shadow-sm hover:bg-slate-50"
-          >
-            <svg
-              className="h-3.5 w-3.5"
-              viewBox="0 0 20 20"
-              fill="none"
-              xmlns="http://www.w3.org/2000/svg"
-              aria-hidden="true"
+      <div className="px-5 pb-2 flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          {chatMessages.length > 0 && (
+            <button
+              type="button"
+              onClick={handleBackToHome}
+              className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-medium text-slate-700 shadow-sm hover:bg-slate-50"
             >
-              <path
-                d="M12.5 4.16666L7.08333 9.58332L12.5 15"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-            返回
-          </button>
+              <svg
+                className="h-3.5 w-3.5"
+                viewBox="0 0 20 20"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+                aria-hidden="true"
+              >
+                <path
+                  d="M12.5 4.16666L7.08333 9.58332L12.5 15"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+              返回
+            </button>
+          )}
         </div>
-      )}
+        <button
+          type="button"
+          onClick={() => {
+            setHistoryPanelOpen((prev) => !prev);
+            setSelectionPanelOpen(false);
+            setNotebookDropdownOpen(false);
+          }}
+          ref={historyButtonRef}
+          className="relative inline-flex items-center justify-center p-2 text-slate-700 hover:text-slate-900"
+          title="对话历史"
+          aria-label="对话历史"
+        >
+          <HistoryIcon className="h-5 w-5" />
+          {chatHistory.length > 0 && (
+            <span className="absolute -right-0.5 -top-0.5 rounded-full bg-[#06c3a8] px-1.5 py-0.5 text-[10px] font-semibold leading-none text-white">
+              {effectiveNotebookId
+                ? chatHistory.filter((session) => session.notebookId === effectiveNotebookId).length
+                : chatHistory.length}
+            </span>
+          )}
+        </button>
+      </div>
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 pb-4">
+      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto show-scrollbar px-5 pb-6">
         {chatMessages.length === 0 ? (
-          <div className="mt-6 flex flex-col items-center">
+          <div className="flex min-h-full flex-col items-center justify-center py-8">
             <div className="relative w-full max-w-3xl mx-auto h-[260px]">
               {/* 中间插画 + 标题 */}
               <div className="absolute left-1/2 top-[58%] flex -translate-x-1/2 -translate-y-1/2 flex-col items-center text-center">
@@ -618,22 +1179,50 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
                 );
               })}
             </div>
-            <div className="mt-14 w-full">
-              {renderMainInput('hero')}
-            </div>
           </div>
         ) : (
           <div className="space-y-3">
             {chatMessages.map((msg, idx) => {
               const isUser = msg.role === 'user';
+              const messageKey = `${msg.role}-${idx}`;
+              const isCopied = copiedMessageKey === messageKey;
               return (
                 <div key={`${msg.role}-${idx}`} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
-                  <div
-                    className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm shadow-sm ${
-                      isUser ? 'bg-[#06c3a8] text-white' : 'bg-white text-slate-800'
-                    }`}
-                  >
-                    {msg.content}
+                  <div className="group flex max-w-[85%] items-end gap-2">
+                    <div
+                      className={`max-w-full min-w-0 whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm shadow-sm ${
+                        isUser ? 'bg-[#06c3a8] text-white' : 'bg-white text-slate-800'
+                      }`}
+                    >
+                      {msg.content}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboard(msg.content, messageKey)}
+                      className={`shrink-0 inline-flex h-7 w-7 items-center justify-center rounded-full transition ${
+                        isUser
+                          ? 'text-white/90 hover:text-white hover:bg-white/10'
+                          : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
+                      } opacity-0 group-hover:opacity-100 focus:opacity-100`}
+                      title={isCopied ? '已复制' : '复制'}
+                      aria-label={isCopied ? '已复制' : '复制'}
+                    >
+                      {isCopied ? (
+                        <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
+                          <path
+                            fill="currentColor"
+                            d="M9 16.2l-3.5-3.5a1 1 0 10-1.4 1.4l4.2 4.2a1 1 0 001.4 0l10-10a1 1 0 10-1.4-1.4L9 16.2z"
+                          />
+                        </svg>
+                      ) : (
+                        <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
+                          <path
+                            fill="currentColor"
+                            d="M16 1H6a2 2 0 00-2 2v12h2V3h10V1zm3 4H10a2 2 0 00-2 2v14a2 2 0 002 2h9a2 2 0 002-2V7a2 2 0 00-2-2zm0 16H10V7h9v14z"
+                          />
+                        </svg>
+                      )}
+                    </button>
                   </div>
                 </div>
               );
@@ -649,11 +1238,11 @@ const NotebookAssistantPage = ({ notebookId }: { notebookId: string }) => {
         )}
       </div>
 
-      {chatMessages.length > 0 && (
-        <div className="mt-3 px-5">
-          {renderMainInput('inline')}
-        </div>
-      )}
+      <div className="shrink-0 px-5 pt-3 pb-4 border-t border-[#d4f3ed] bg-[#eef6fd]">
+        {renderMainInput(chatMessages.length === 0 ? 'hero' : 'inline')}
+      </div>
+      {renderSelectionDrawer()}
+      {renderHistoryDrawer()}
     </div>
   );
 };

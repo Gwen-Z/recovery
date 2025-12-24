@@ -1,9 +1,14 @@
-import React, { useLayoutEffect, useMemo, useRef, useState, useEffect, useCallback } from 'react';
+import React, { useLayoutEffect, useMemo, useRef, useState, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import apiClient, { type Notebook } from '../apiClient';
+import { DEFAULT_AI_SUMMARY_PROMPT, PARSE_SETTINGS_STORAGE_KEY, readTextPrompt } from '../constants/aiSummary';
+import { PARSE_HISTORY_EVENTS } from '../constants/events';
+import { useAiSummaryPrompts } from '../hooks/useAiSummaryPrompts';
+import { useOutsideClose } from '../hooks/useOutsideClose';
+import { computeAvoidOffset, saveQuickNoteDraft } from '../utils/workspaceUtils';
+import { consumeWorkspaceStartAction } from '../utils/workspaceStartAction';
 import ParseHistoryPanel from './ParseHistoryPanel';
 import FieldTemplateModal from './FieldTemplateModal';
-import CustomNotebookModal from './CustomNotebookModal';
 import { useFieldTemplate } from '../hooks/useFieldTemplate';
 
 type InputMode = 'link' | 'text';
@@ -210,18 +215,16 @@ const TextParseIcon = ({ className }: { className?: string }) => (
 );
 
 // —— 工具：计算从 card center 指向 bubble 的单位向量 * 强度（用于“让路”偏移）——
-function computeAvoidOffset(
-  bubblePx: { x: number; y: number },
-  cardCenterPx: { x: number; y: number },
-  strength: number
-) {
-  const dx = bubblePx.x - cardCenterPx.x;
-  const dy = bubblePx.y - cardCenterPx.y;
-  const len = Math.sqrt(dx * dx + dy * dy) || 1;
-  return { x: (dx / len) * strength, y: (dy / len) * strength };
-}
 
-const CreateWorkspacePage: React.FC = () => {
+type CreateWorkspacePageProps = {
+  notebooks: Notebook[];
+  onRequestNotebookRefresh?: () => void;
+};
+
+const CreateWorkspacePage: React.FC<CreateWorkspacePageProps> = ({
+  notebooks,
+  onRequestNotebookRefresh
+}) => {
   const navigate = useNavigate();
 
   const [mode, setMode] = useState<InputMode>('link');
@@ -233,7 +236,6 @@ const CreateWorkspacePage: React.FC = () => {
   const [startActionError, setStartActionError] = useState<string | null>(null);
   const [startActionSuccess, setStartActionSuccess] = useState<string | null>(null);
   const [startParseLoading, setStartParseLoading] = useState(false);
-  const [customNotebookModalOpen, setCustomNotebookModalOpen] = useState(false);
 
   // hover 状态（第三方案：前景卡片静止；中景气泡根据状态轻微变化）
   const [isCardHover, setIsCardHover] = useState(false);
@@ -255,6 +257,28 @@ const CreateWorkspacePage: React.FC = () => {
     (mode === 'link'
       ? '粘贴你想整理的文章链接，例如：https://example.com/article'
       : '简单描述你想整理的内容，或直接粘贴一段文本…');
+
+  const [pendingAutoStart, setPendingAutoStart] = useState<{
+    mode: InputMode;
+    inputValue: string;
+    activeSceneId: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    const action = consumeWorkspaceStartAction();
+    if (!action) return;
+    setMode(action.mode);
+    setInputValue(action.inputValue);
+    setActiveSceneId(action.activeSceneId);
+    setPendingAutoStart({
+      mode: action.mode,
+      inputValue: action.inputValue,
+      activeSceneId: action.activeSceneId
+    });
+    // 清掉一些提示，避免用户误以为上一次状态还在
+    setStartActionError(null);
+    setStartActionSuccess(null);
+  }, []);
 
   // 测量容器尺寸与 card 中心点（只在 resize / 初次渲染更新，不做帧级计算）
   useLayoutEffect(() => {
@@ -279,18 +303,33 @@ const CreateWorkspacePage: React.FC = () => {
       });
     };
 
+    let rafId: number | null = null;
+    const scheduleMeasure = () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+      }
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        measure();
+      });
+    };
+
     measure();
-    const ro = new ResizeObserver(() => measure());
+    const ro = new ResizeObserver(() => scheduleMeasure());
     if (wrapRef.current) ro.observe(wrapRef.current);
     if (cardRef.current) ro.observe(cardRef.current);
 
-    window.addEventListener('resize', measure);
-    window.addEventListener('scroll', measure, true);
+    const scrollOptions = { capture: true, passive: true } as const;
+    window.addEventListener('resize', scheduleMeasure);
+    window.addEventListener('scroll', scheduleMeasure, scrollOptions);
 
     return () => {
       ro.disconnect();
-      window.removeEventListener('resize', measure);
-      window.removeEventListener('scroll', measure, true);
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+      }
+      window.removeEventListener('resize', scheduleMeasure);
+      window.removeEventListener('scroll', scheduleMeasure, scrollOptions);
     };
   }, []);
 
@@ -345,7 +384,6 @@ const CreateWorkspacePage: React.FC = () => {
 	    });
 	  }, [layout, isCardHover, hoverBubbleId, activeSceneId]);
 
-  const [notebooks, setNotebooks] = useState<Notebook[]>([]);
   const notebookOptions = useMemo(
     () =>
       notebooks.map((nb) => ({
@@ -364,99 +402,18 @@ const CreateWorkspacePage: React.FC = () => {
   });
   const activeFieldTemplate = mode === 'link' ? linkFieldTemplate : manualFieldTemplate;
 
-  const DEFAULT_AI_SUMMARY_PROMPT =
-    '请将内容整理为不超过5条的要点，突出文章核心信息，使用简洁的中文有序列表输出。';
-  const PARSE_SETTINGS_STORAGE_KEY = 'ai_parse_settings_v1';
-  const TEXT_PROMPT_STORAGE_KEY = 'ai_parse_text_prompt_v1';
+  const {
+    linkPrompt: linkAiPrompt,
+    textPrompt: textAiPrompt,
+    setLinkPrompt: updateLinkAiPrompt,
+    setTextPrompt: updateTextAiPrompt
+  } = useAiSummaryPrompts();
 
-  const [linkAiPrompt, setLinkAiPrompt] = useState(DEFAULT_AI_SUMMARY_PROMPT);
-  const [textAiPrompt, setTextAiPrompt] = useState(DEFAULT_AI_SUMMARY_PROMPT);
+  const requestNotebookRefresh = useCallback(() => {
+    onRequestNotebookRefresh?.();
+  }, [onRequestNotebookRefresh]);
 
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const syncPromptsFromStorage = () => {
-      try {
-        const stored = window.localStorage.getItem(PARSE_SETTINGS_STORAGE_KEY);
-        if (stored) {
-          const parsed = JSON.parse(stored);
-          const prompt =
-            typeof parsed?.aiSummaryPrompt === 'string' && parsed.aiSummaryPrompt.trim()
-              ? parsed.aiSummaryPrompt.trim()
-              : DEFAULT_AI_SUMMARY_PROMPT;
-          setLinkAiPrompt(prompt);
-        } else {
-          setLinkAiPrompt(DEFAULT_AI_SUMMARY_PROMPT);
-        }
-      } catch {
-        setLinkAiPrompt(DEFAULT_AI_SUMMARY_PROMPT);
-      }
-      try {
-        const stored = window.localStorage.getItem(TEXT_PROMPT_STORAGE_KEY);
-        if (stored && stored.trim()) {
-          setTextAiPrompt(stored.trim());
-        } else {
-          setTextAiPrompt(DEFAULT_AI_SUMMARY_PROMPT);
-        }
-      } catch {
-        setTextAiPrompt(DEFAULT_AI_SUMMARY_PROMPT);
-      }
-    };
-
-    const handleStorage = (event: StorageEvent) => {
-      if (!event.key || event.key === PARSE_SETTINGS_STORAGE_KEY || event.key === TEXT_PROMPT_STORAGE_KEY) {
-        syncPromptsFromStorage();
-      }
-    };
-
-    syncPromptsFromStorage();
-    window.addEventListener('storage', handleStorage);
-    return () => window.removeEventListener('storage', handleStorage);
-  }, []);
-
-  const updateLinkAiPrompt = useCallback((nextPrompt: string) => {
-    const trimmed = (nextPrompt || '').trim() || DEFAULT_AI_SUMMARY_PROMPT;
-    setLinkAiPrompt(trimmed);
-    if (typeof window === 'undefined') return;
-    try {
-      const stored = window.localStorage.getItem(PARSE_SETTINGS_STORAGE_KEY);
-      const current = stored ? JSON.parse(stored) : {};
-      const nextSettings = {
-        ...current,
-        aiSummaryPrompt: trimmed
-      };
-      window.localStorage.setItem(PARSE_SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings));
-    } catch (err) {
-      console.warn('无法保存链接解析提示词', err);
-    }
-  }, []);
-
-  const updateTextAiPrompt = useCallback((nextPrompt: string) => {
-    const trimmed = (nextPrompt || '').trim() || DEFAULT_AI_SUMMARY_PROMPT;
-    setTextAiPrompt(trimmed);
-    if (typeof window === 'undefined') return;
-    try {
-      window.localStorage.setItem(TEXT_PROMPT_STORAGE_KEY, trimmed);
-    } catch (err) {
-      console.warn('无法保存文本解析提示词', err);
-    }
-  }, []);
-
-  const loadNotebooks = useCallback(async () => {
-    try {
-      const notebookList = await apiClient.getNotebooks();
-      setNotebooks(notebookList);
-    } catch (err) {
-      console.warn('工作台加载笔记本列表失败（将继续显示解析历史）:', err);
-      setNotebooks([]);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadNotebooks();
-  }, [loadNotebooks]);
-
-  const getCurrentAiSummaryConfig = useCallback(
-    (target: InputMode) => {
+  const getCurrentAiSummaryConfig = useCallback((target: InputMode) => {
       const fallback = {
         linkAiSummaryEnabled: true,
         textAiSummaryEnabled: true,
@@ -496,42 +453,107 @@ const CreateWorkspacePage: React.FC = () => {
       if (target === 'link') {
         return {
           enabled: parseSettings.linkAiSummaryEnabled,
-          prompt: (linkAiPrompt || DEFAULT_AI_SUMMARY_PROMPT).trim() || DEFAULT_AI_SUMMARY_PROMPT,
+          prompt: (parseSettings.aiSummaryPrompt || DEFAULT_AI_SUMMARY_PROMPT).trim() || DEFAULT_AI_SUMMARY_PROMPT,
           syncToNotebookTemplate: parseSettings.syncToNotebookTemplate
         };
       }
       return {
         enabled: parseSettings.textAiSummaryEnabled,
-        prompt: (textAiPrompt || DEFAULT_AI_SUMMARY_PROMPT).trim() || DEFAULT_AI_SUMMARY_PROMPT,
+        prompt: readTextPrompt(),
         syncToNotebookTemplate: parseSettings.syncToNotebookTemplate
       };
+    }, []);
+
+  const openParseHistoryPanel = useCallback(() => {
+    window.dispatchEvent(new CustomEvent(PARSE_HISTORY_EVENTS.open));
+  }, []);
+
+  const refreshParseHistory = useCallback(() => {
+    window.dispatchEvent(new CustomEvent(PARSE_HISTORY_EVENTS.refresh));
+  }, []);
+
+  const notifyParseHistoryCreated = useCallback(
+    (historyId?: string | null) => {
+      if (historyId) {
+        window.dispatchEvent(new CustomEvent(PARSE_HISTORY_EVENTS.created, { detail: { historyId } }));
+      } else {
+        refreshParseHistory();
+      }
     },
-    [linkAiPrompt, textAiPrompt]
+    [refreshParseHistory]
   );
 
-  const handleStartParse = useCallback(async () => {
-    const trimmed = inputValue.trim();
+  type ParseSuccessPayload = {
+    message?: string;
+    historyId?: string | null;
+    assigned?: boolean;
+  };
+
+  const applySuccessState = useCallback(
+    (payload: ParseSuccessPayload) => {
+      setStartActionSuccess(payload.message || '解析成功');
+      setInputValue('');
+      setActiveSceneId(null);
+      notifyParseHistoryCreated(payload.historyId || null);
+      if (payload.assigned) {
+        requestNotebookRefresh();
+      }
+    },
+    [notifyParseHistoryCreated, requestNotebookRefresh]
+  );
+
+  const applyDraftState = useCallback(
+    (historyId?: string | null) => {
+      setStartActionSuccess('已存为草稿，已放入解析/分配历史');
+      setInputValue('');
+      setActiveSceneId(null);
+      notifyParseHistoryCreated(historyId || null);
+    },
+    [notifyParseHistoryCreated]
+  );
+
+  const handleStartParse = useCallback(async (override?: { mode?: InputMode; inputValue?: string }) => {
+    const currentMode = override?.mode ?? mode;
+    const currentInputValue = override?.inputValue ?? inputValue;
+    const trimmed = currentInputValue.trim();
     if (!trimmed) {
-      setStartActionError('请输入内容后再开始解析');
+      setStartActionError(currentMode === 'link' ? '请输入内容后再开始解析' : '请输入内容后再开始 AI 分配');
       setStartActionSuccess(null);
       return;
     }
+
+    // 文本过长时引导进入富文本编辑页（避免在 workspace 输入框里继续操作导致体验混乱）
+    if (currentMode === 'text' && trimmed.length > 50) {
+      const go = window.confirm('内容超过 50 字，建议进入富文本编辑器继续编辑并保存为笔记。是否前往？');
+      if (go) {
+        saveQuickNoteDraft(trimmed);
+        navigate('/notes');
+      }
+      return;
+    }
+
     setStartParseLoading(true);
     setStartActionError(null);
     setStartActionSuccess(null);
 
-    try {
-      window.dispatchEvent(new CustomEvent('parse-history:open'));
-
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(
-          () =>
-            reject(new Error('请求超时，解析可能需要较长时间。请稍后在"解析历史"中查看结果。')),
-          600000
-        );
+    const createTimeout = (ms: number, message: string) => {
+      let timeoutId: number | null = null;
+      const promise = new Promise<never>((_, reject) => {
+        timeoutId = window.setTimeout(() => reject(new Error(message)), ms);
       });
+      const cancel = () => {
+        if (timeoutId === null) return;
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      };
+      return { promise, cancel };
+    };
 
-      if (mode === 'link') {
+    let cancelTimeout = () => {};
+    try {
+      openParseHistoryPanel();
+
+      if (currentMode === 'link') {
         try {
           new URL(trimmed);
         } catch {
@@ -541,17 +563,11 @@ const CreateWorkspacePage: React.FC = () => {
 
         const existsResp = (await apiClient.post('/api/coze/check-article-exists', {
           articleUrl: trimmed
-        })) as any;
+        })) as { data?: { success?: boolean; exists?: boolean; existingHistoryId?: string | null } };
         if (existsResp?.data?.success && existsResp.data.exists) {
           const existingHistoryId = existsResp.data.existingHistoryId || null;
-          setStartActionError('链接已存在，请在解析历史中查看。');
-          if (existingHistoryId) {
-            window.dispatchEvent(
-              new CustomEvent('parse-history:created', { detail: { historyId: existingHistoryId } })
-            );
-          } else {
-            window.dispatchEvent(new CustomEvent('parse-history:refresh'));
-          }
+          setStartActionError('链接已存在，请在解析/分配历史中查看。');
+          notifyParseHistoryCreated(existingHistoryId);
           return;
         }
 
@@ -560,26 +576,20 @@ const CreateWorkspacePage: React.FC = () => {
           query: '请提取并整理这篇文章的主要内容，保留关键信息和结构。同时根据文章主题推荐一个合适的笔记本分类（如果有）。',
           aiSummaryConfig: getCurrentAiSummaryConfig('link')
         });
-        const response = (await Promise.race([apiPromise, timeoutPromise])) as any;
+        const timeout = createTimeout(
+          600000,
+          '请求超时，解析可能需要较长时间。请稍后在"解析/分配历史"中查看结果。'
+        );
+        cancelTimeout = timeout.cancel;
+        const response = (await Promise.race([apiPromise, timeout.promise])) as {
+          data?: { success?: boolean; data?: ParseSuccessPayload; error?: string };
+        };
         if (response?.data?.success) {
-          const payload = response.data.data || {};
-          setStartActionSuccess(payload.message || '解析成功');
-          setInputValue('');
-          setActiveSceneId(null);
-          if (payload.historyId) {
-            window.dispatchEvent(
-              new CustomEvent('parse-history:created', { detail: { historyId: payload.historyId } })
-            );
-          } else {
-            window.dispatchEvent(new CustomEvent('parse-history:refresh'));
-          }
-          if (payload.assigned) {
-            loadNotebooks();
-          }
+          applySuccessState(response.data.data || {});
           return;
         }
         setStartActionError(response?.data?.error || '解析并分配失败，请稍后再试');
-        window.dispatchEvent(new CustomEvent('parse-history:refresh'));
+        refreshParseHistory();
         return;
       }
 
@@ -588,65 +598,59 @@ const CreateWorkspacePage: React.FC = () => {
         img_urls: [],
         aiSummaryConfig: getCurrentAiSummaryConfig('text')
       });
-      const response = (await Promise.race([apiPromise, timeoutPromise])) as any;
+      const timeout = createTimeout(
+        600000,
+        '请求超时，解析可能需要较长时间。请稍后在"解析/分配历史"中查看结果。'
+      );
+      cancelTimeout = timeout.cancel;
+      const response = (await Promise.race([apiPromise, timeout.promise])) as {
+        data?: { success?: boolean; data?: ParseSuccessPayload; error?: string };
+      };
       if (response?.data?.success) {
-        const payload = response.data.data || {};
-        setStartActionSuccess(payload.message || '解析成功');
-        setInputValue('');
-        setActiveSceneId(null);
-        if (payload.historyId) {
-          window.dispatchEvent(
-            new CustomEvent('parse-history:created', { detail: { historyId: payload.historyId } })
-          );
-        } else {
-          window.dispatchEvent(new CustomEvent('parse-history:refresh'));
-        }
-        if (payload.assigned) {
-          loadNotebooks();
-        }
+        applySuccessState(response.data.data || {});
         return;
       }
       setStartActionError(response?.data?.error || '解析并分配失败');
-      window.dispatchEvent(new CustomEvent('parse-history:refresh'));
+      refreshParseHistory();
     } catch (err: any) {
       console.error('开始解析失败:', err);
       if (err?.message?.includes('超时') || err?.message?.includes('timeout')) {
-        setStartActionError('解析超时，可能需要更长时间。请稍后在"解析历史"中查看结果，或稍后重试。');
+        setStartActionError('解析超时，可能需要更长时间。请稍后在"解析/分配历史"中查看结果，或稍后重试。');
       } else {
         setStartActionError(err?.response?.data?.error || err?.message || '解析并分配失败');
       }
-      window.dispatchEvent(new CustomEvent('parse-history:refresh'));
+      refreshParseHistory();
     } finally {
+      cancelTimeout();
       setStartParseLoading(false);
     }
-  }, [getCurrentAiSummaryConfig, inputValue, loadNotebooks, mode]);
+  }, [
+    applySuccessState,
+    getCurrentAiSummaryConfig,
+    inputValue,
+    mode,
+    navigate,
+    notifyParseHistoryCreated,
+    openParseHistoryPanel,
+    refreshParseHistory
+  ]);
+
+  useEffect(() => {
+    if (!pendingAutoStart) return;
+    const action = pendingAutoStart;
+    const timer = window.setTimeout(() => {
+      handleStartParse({ mode: action.mode, inputValue: action.inputValue });
+      // 仅触发一次：等真正开始执行后再清理，避免 effect cleanup 把 timer 清掉导致不执行
+      setPendingAutoStart(null);
+    }, 220);
+    return () => window.clearTimeout(timer);
+  }, [pendingAutoStart, handleStartParse]);
 
   const closeStartMenu = useCallback(() => setStartMenuOpen(false), []);
+  const closeModeMenu = useCallback(() => setModeMenuOpen(false), []);
 
-  useEffect(() => {
-    if (!startMenuOpen) return;
-    const handlePointerDown = (event: MouseEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (!target) return;
-      // 点击在菜单或按钮组内不关闭
-      if (target.closest('[data-start-menu-root="1"]')) return;
-      closeStartMenu();
-    };
-    document.addEventListener('mousedown', handlePointerDown);
-    return () => document.removeEventListener('mousedown', handlePointerDown);
-  }, [startMenuOpen, closeStartMenu]);
-
-  useEffect(() => {
-    if (!modeMenuOpen) return;
-    const handlePointerDown = (event: MouseEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (!target) return;
-      if (target.closest('[data-mode-menu-root="1"]')) return;
-      setModeMenuOpen(false);
-    };
-    document.addEventListener('mousedown', handlePointerDown);
-    return () => document.removeEventListener('mousedown', handlePointerDown);
-  }, [modeMenuOpen]);
+  useOutsideClose(startMenuOpen, '[data-start-menu-root="1"]', closeStartMenu);
+  useOutsideClose(modeMenuOpen, '[data-mode-menu-root="1"]', closeModeMenu);
 
   const handleSaveDraft = useCallback(async () => {
     const trimmed = inputValue.trim();
@@ -663,10 +667,10 @@ const CreateWorkspacePage: React.FC = () => {
     setStartMenuOpen(false);
 
     try {
-      window.dispatchEvent(new CustomEvent('parse-history:open'));
+      openParseHistoryPanel();
       if (mode === 'link') {
-        // 允许把链接作为“草稿”保存到解析历史（不触发解析与分配）
-        // 用 parse-text 复用后端写入解析历史的逻辑
+        // 允许把链接作为“草稿”保存到解析/分配历史（不触发解析与分配）
+        // 用 parse-text 复用后端写入解析/分配历史的逻辑
         const response = (await apiClient.post('/api/parse-text', {
           title: '链接草稿',
           content: trimmed,
@@ -675,21 +679,13 @@ const CreateWorkspacePage: React.FC = () => {
             draft: true
           },
           aiSummaryConfig: { enabled: false, prompt: '' }
-        })) as any;
-
+        })) as { data?: { data?: { historyId?: string | null } } };
         const historyId = response?.data?.data?.historyId || null;
-        setStartActionSuccess('已存为草稿，已放入解析历史');
-        setInputValue('');
-        setActiveSceneId(null);
-        if (historyId) {
-          window.dispatchEvent(new CustomEvent('parse-history:created', { detail: { historyId } }));
-        } else {
-          window.dispatchEvent(new CustomEvent('parse-history:refresh'));
-        }
+        applyDraftState(historyId);
         return;
       }
 
-      // 文本草稿：保存到解析历史（不触发解析与分配）
+      // 文本草稿：保存到解析/分配历史（不触发解析与分配）
       const response = (await apiClient.post('/api/parse-text', {
         title: trimmed.split('\n').map((l: string) => l.trim()).find((l: string) => l) || '文本草稿',
         content: trimmed,
@@ -698,24 +694,16 @@ const CreateWorkspacePage: React.FC = () => {
           draft: true
         },
         aiSummaryConfig: { enabled: false, prompt: '' }
-      })) as any;
-
+      })) as { data?: { data?: { historyId?: string | null } } };
       const historyId = response?.data?.data?.historyId || null;
-      setStartActionSuccess('已存为草稿，已放入解析历史');
-      setInputValue('');
-      setActiveSceneId(null);
-      if (historyId) {
-        window.dispatchEvent(new CustomEvent('parse-history:created', { detail: { historyId } }));
-      } else {
-        window.dispatchEvent(new CustomEvent('parse-history:refresh'));
-      }
+      applyDraftState(historyId);
     } catch (err: any) {
       console.error('存草稿失败:', err);
       setStartActionError(err?.response?.data?.error || err?.message || '存草稿失败');
     } finally {
       setStartActionLoading(false);
     }
-  }, [inputValue, mode]);
+  }, [applyDraftState, inputValue, mode, openParseHistoryPanel]);
 
   const startBusy = startParseLoading || startActionLoading;
 
@@ -750,19 +738,6 @@ const CreateWorkspacePage: React.FC = () => {
           .bubble-outer { transition: none !important; }
         }
       `}</style>
-
-      {/* 顶部导航 */}
-      <header className="flex items-center justify-between px-6 pb-4">
-        <div className="flex items-center gap-3 text-sm">
-          <button
-            type="button"
-            onClick={() => setCustomNotebookModalOpen(true)}
-            className="rounded-full bg-white/80 px-4 py-2 text-xs font-medium text-slate-700 shadow-sm hover:bg-white transition-colors"
-          >
-            新建笔记本
-          </button>
-        </div>
-      </header>
 
       {/* Hero 区：三层空间 + 下方解析栏 */}
       <main className="flex-1 flex flex-col items-center justify-center px-4 pb-10">
@@ -828,7 +803,7 @@ const CreateWorkspacePage: React.FC = () => {
             </h1>
 
             <p className="mt-3 max-w-2xl mx-auto text-[13px] leading-relaxed text-slate-500 md:text-[14px]">
-              支持链接解析、文本解析
+              支持链接解析、随手记
             </p>
           </div>
 
@@ -854,7 +829,7 @@ const CreateWorkspacePage: React.FC = () => {
                           <TextParseIcon className="h-4 w-4 text-slate-500" />
                         )}
                       </span>
-                      <span>{mode === 'link' ? '链接解析' : '文本解析'}</span>
+                      <span>{mode === 'link' ? '链接解析' : '随手记'}</span>
                       <span className="ml-auto text-slate-400">
                         <svg className={`h-3 w-3 transition ${modeMenuOpen ? 'rotate-180' : ''}`} viewBox="0 0 24 24" fill="none">
                           <path
@@ -872,7 +847,7 @@ const CreateWorkspacePage: React.FC = () => {
                         <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
                           {[
                             { value: 'link' as InputMode, label: '链接解析', Icon: LinkParseIcon },
-                            { value: 'text' as InputMode, label: '文本解析', Icon: TextParseIcon }
+                            { value: 'text' as InputMode, label: '随手记', Icon: TextParseIcon }
                           ].map(({ value, label, Icon }) => {
                             const active = mode === value;
                             return (
@@ -927,15 +902,35 @@ const CreateWorkspacePage: React.FC = () => {
                       />
                     </div>
                     <div className="flex items-center">
-                      <div className="relative inline-flex flex-1" data-start-menu-root="1">
-                        <button
-                          type="button"
-                          onClick={handleStartParse}
-                          disabled={startBusy}
-                          className="inline-flex items-center justify-center gap-2 rounded-l-full bg-gradient-to-r from-[#06c3a8] to-[#43ccb0] px-5 py-2 text-sm font-semibold text-white shadow-[0_16px_32px_rgba(6,195,168,0.32)] hover:brightness-110 transition disabled:opacity-70"
-                        >
+                      <div className="relative inline-flex flex-1 group" data-start-menu-root="1">
+                        {mode === 'text' && (
+                          <div className="pointer-events-none absolute -top-10 left-1/2 z-30 flex -translate-x-1/2 flex-col items-center opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+                            <div className="rounded-md bg-slate-800 px-2 py-1 text-xs text-white shadow-lg whitespace-nowrap">
+                              AI将分配到合适的归属笔记本
+                            </div>
+                            <div className="h-0 w-0 border-x-4 border-x-transparent border-t-4 border-t-slate-800" />
+                          </div>
+                        )}
+	                        <button
+	                          type="button"
+	                          onClick={() => handleStartParse()}
+	                          disabled={startBusy}
+	                          className="inline-flex items-center justify-center gap-2 rounded-l-full bg-gradient-to-r from-[#06c3a8] to-[#43ccb0] px-5 py-2 text-sm font-semibold text-white shadow-[0_16px_32px_rgba(6,195,168,0.32)] hover:brightness-110 transition disabled:opacity-70"
+	                        >
                           <span className="text-base">✨</span>
-                          <span>{startParseLoading ? '解析中…' : startActionLoading ? '处理中…' : '开始解析'}</span>
+                          <span>
+                            {mode === 'link'
+                              ? startParseLoading
+                                ? '解析中…'
+                                : startActionLoading
+                                  ? '处理中…'
+                                  : '开始解析'
+                              : startParseLoading
+                                ? 'AI分配中…'
+                                : startActionLoading
+                                  ? '处理中…'
+                                  : 'AI分配'}
+                          </span>
                         </button>
                         <button
                           type="button"
@@ -1015,18 +1010,11 @@ const CreateWorkspacePage: React.FC = () => {
           )}
         </div>
 
-        {/* 解析历史（完整复刻 AI 导入页能力） */}
+        {/* 解析/分配历史（完整复刻 AI 导入页能力） */}
         <div className="mt-5 w-full max-w-4xl">
           <ParseHistoryPanel
-            notebooks={notebooks.map(nb => ({
-              notebook_id: nb.notebook_id,
-              name: nb.name,
-              description: nb.description ?? null,
-              note_count: nb.note_count,
-              created_at: nb.created_at,
-              updated_at: nb.updated_at
-            }))}
-            onRequestNotebookRefresh={loadNotebooks}
+            notebooks={notebooks}
+            onRequestNotebookRefresh={onRequestNotebookRefresh}
           />
         </div>
 
@@ -1065,11 +1053,6 @@ const CreateWorkspacePage: React.FC = () => {
           onSave={manualFieldTemplate.saveTemplate}
           aiSummaryPrompt={textAiPrompt}
           onAiSummaryPromptChange={updateTextAiPrompt}
-        />
-        <CustomNotebookModal
-          open={customNotebookModalOpen}
-          onClose={() => setCustomNotebookModalOpen(false)}
-          onCreated={loadNotebooks}
         />
       </main>
     </div>

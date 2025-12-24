@@ -901,7 +901,7 @@ const ParseHistoryEditModal: React.FC<ParseHistoryEditModalProps> = ({
       <div className="bg-white rounded-2xl shadow-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
         <div className="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between">
           <div>
-            <h2 className="text-lg font-semibold text-slate-900">编辑解析历史</h2>
+            <h2 className="text-lg font-semibold text-slate-900">编辑解析/分配历史</h2>
             <p className="text-xs text-slate-400 mt-1">ID: <span className="font-mono">{history.id}</span></p>
           </div>
           <button

@@ -67,8 +67,8 @@ function AIAnalysisComponent({
                 
                 {(() => {
                   const displayTitle = mapTitleToDisplay(insight.title || '');
-                  const isExtensionDirection = displayTitle === '延伸方向';
-                  const isNotesPoints = displayTitle === '笔记要点';
+                  const isExtensionDirection = displayTitle === '个性化建议';
+                  const isNotesPoints = displayTitle === '变化趋势';
                   
                   // 如果是"延伸方向"，不显示 description，直接显示列表
                   if (isExtensionDirection && insight.suggestions && insight.suggestions.length > 0) {
@@ -185,7 +185,7 @@ function AIAnalysisComponent({
                       {/* 建议行动 - 非延伸方向的情况 */}
                       {insight.suggestions && insight.suggestions.length > 0 && (
                         <div className="rounded-lg bg-indigo-50/70 border border-indigo-100 p-3">
-                          <div className="font-medium text-indigo-900 mb-2" style={{ fontSize: '12px' }}>💡 延伸方向：</div>
+                          <div className="font-medium text-indigo-900 mb-2" style={{ fontSize: '12px' }}>💡 个性化建议：</div>
                           <ul className="space-y-1">
                             {insight.suggestions.map((suggestion, suggestionIndex) => (
                               <li key={suggestionIndex} className="text-indigo-800 flex items-start" style={{ fontSize: '12px' }}>
@@ -253,10 +253,13 @@ function getInsightIcon(type: string): string {
  */
 function mapTitleToDisplay(title: string): string {
   const titleMap: Record<string, string> = {
-    '关键发现': '一句话总结',
-    '趋势分析': '笔记要点',
-    '建议与行动': '延伸方向',
-    '建议': '延伸方向'
+    '关键发现': '主要洞察',
+    '一句话总结': '主要洞察',
+    '趋势分析': '变化趋势',
+    '笔记要点': '变化趋势',
+    '建议与行动': '个性化建议',
+    '建议': '个性化建议',
+    '延伸方向': '个性化建议'
   };
   
   // 如果标题在映射表中，返回映射后的标题

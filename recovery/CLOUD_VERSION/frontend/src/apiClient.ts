@@ -1,5 +1,6 @@
 import type { ComponentConfig } from './utils/componentSync';
 import type { FieldTemplateField, FieldTemplateSource } from './types/fieldTemplate';
+import type { AnalysisV3Request, AnalysisV3Response } from './types/Analysis';
 
 // API客户端配置
 // 兼容多环境：
@@ -436,7 +437,7 @@ class ApiClient {
     }
   }
 
-  async post(url: string, data?: any) {
+  async post<T = any>(url: string, data?: any): Promise<{ data: T; status: number; headers: Headers }> {
     try {
       const fullUrl = `${this.baseURL}${url}`;
       console.log('📤 POST请求:', fullUrl);
@@ -707,6 +708,16 @@ class ApiClient {
       
       throw error;
     }
+  }
+
+  async analyzeV3(request: AnalysisV3Request): Promise<AnalysisV3Response> {
+    const response = await this.post('/api/analysis/v3', request);
+    return response.data as AnalysisV3Response;
+  }
+
+  async getAnalysisV3Debug(analysisId: string): Promise<any> {
+    const response = await this.get(`/api/analysis/v3/${analysisId}/debug`);
+    return response.data;
   }
 
   async getAnalysisResult(analysisId: string): Promise<any> {

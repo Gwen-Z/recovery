@@ -10,6 +10,251 @@ import { normalizeParseHistoryStatus, getParseHistoryStatusVariants } from '../l
 import { sanitizeString } from '../lib/string-utils.js';
 import AIService from '../services/ai-service.js';
 
+// Coze 在部分网络环境下可能对 TLS/代理/长连接较敏感：
+// - 显式指定 SNI（servername）
+// - 强制最低 TLS1.2
+// - keepAlive 关闭，避免长连接被中间设备切断
+// ⚠️ 不要在 Agent 上设置过短 timeout：Coze 解析可能 >60s，会导致 ECONNRESET/socket hang up
+const createCozeHttpsAgent = () =>
+  new https.Agent({
+    keepAlive: false,
+    // 强制走 IPv4，避免某些网络环境 IPv6 握手/路由不稳定导致 ECONNRESET
+    family: 4,
+    // 显式指定 SNI，避免部分网络/代理环境下握手不带 server_name 导致服务端直接 reset
+    servername: 'api.coze.cn',
+    minVersion: 'TLSv1.2',
+    // 指定常见安全套件，提升兼容性（与诊断脚本保持一致）
+    ciphers: [
+      'ECDHE-ECDSA-AES128-GCM-SHA256',
+      'ECDHE-RSA-AES128-GCM-SHA256',
+      'ECDHE-ECDSA-AES256-GCM-SHA384',
+      'ECDHE-RSA-AES256-GCM-SHA384',
+      'ECDHE-ECDSA-CHACHA20-POLY1305',
+      'ECDHE-RSA-CHACHA20-POLY1305',
+      'DHE-RSA-AES128-GCM-SHA256',
+      'DHE-RSA-AES256-GCM-SHA384'
+    ].join(':')
+  });
+
+const MAX_TITLE_LENGTH = 256;
+const MAX_CONTENT_LENGTH = 100_000;
+
+const clampText = (value, maxLen) => {
+  if (!value || typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (trimmed.length <= maxLen) return trimmed;
+  return `${trimmed.slice(0, maxLen)}\n\n（内容过长，已截断）`;
+};
+
+const decodeHtmlEntities = (input = '') => {
+  if (!input || typeof input !== 'string') return '';
+  return input
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+};
+
+const htmlToText = (html = '') => {
+  if (!html || typeof html !== 'string') return '';
+  let text = html;
+  text = text.replace(/<script[\s\S]*?<\/script>/gi, '');
+  text = text.replace(/<style[\s\S]*?<\/style>/gi, '');
+  text = text.replace(/<br\s*\/?>/gi, '\n');
+  text = text.replace(/<\/(p|div|section|article|figure|h1|h2|h3|h4|h5|h6|li)>/gi, '\n');
+  text = text.replace(/<li[^>]*>/gi, '- ');
+  text = text.replace(/<[^>]+>/g, '');
+  text = decodeHtmlEntities(text);
+  // 折叠多余空白
+  text = text.replace(/\r/g, '');
+  text = text.replace(/\n{3,}/g, '\n\n');
+  return text.trim();
+};
+
+const extractImgUrlsFromHtml = (html = '') => {
+  if (!html || typeof html !== 'string') return [];
+  const urls = [];
+  const re = /<img[^>]+src=["']([^"']+)["'][^>]*>/gi;
+  let match;
+  while ((match = re.exec(html))) {
+    const src = (match[1] || '').trim();
+    if (!src) continue;
+    // 去掉 x-oss-process 等参数，保留原图在 original-src 上的情况
+    if (!urls.includes(src)) urls.push(src);
+  }
+  // 兼容 longport 的 original-src
+  const re2 = /original-src=["']([^"']+)["']/gi;
+  while ((match = re2.exec(html))) {
+    const src = (match[1] || '').trim();
+    if (!src) continue;
+    if (!urls.includes(src)) urls.push(src);
+  }
+  return urls;
+};
+
+const tryExtractFromJsonLd = (html = '') => {
+  const matches = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const m of matches) {
+    const raw = (m[1] || '').trim();
+    if (!raw) continue;
+    try {
+      const obj = JSON.parse(raw);
+      const type = obj?.['@type'];
+      const isArticle = type === 'Article' || (Array.isArray(type) && type.includes('Article'));
+      if (!isArticle && !obj?.headline) continue;
+      const title = obj?.headline || '';
+      const author = obj?.author?.name || (Array.isArray(obj?.author) ? obj.author?.[0]?.name : '') || '';
+      const publishedAt = obj?.datePublished || obj?.dateModified || '';
+      const images = Array.isArray(obj?.image) ? obj.image : obj?.image ? [obj.image] : [];
+      const bodyHtml = obj?.articleBody || obj?.text || obj?.description || '';
+      return {
+        title,
+        author,
+        publishedAt,
+        images: images.filter(Boolean),
+        bodyHtml
+      };
+    } catch {
+      // ignore
+    }
+  }
+  return null;
+};
+
+const safeGet = (obj, path, fallback = null) => {
+  try {
+    return path.split('.').reduce((acc, key) => (acc && acc[key] !== undefined ? acc[key] : undefined), obj) ?? fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+const tryExtractFromNextData = (html = '') => {
+  const m = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (!m) return null;
+  const raw = (m[1] || '').trim();
+  if (!raw) return null;
+  try {
+    const data = JSON.parse(raw);
+    const pageProps = safeGet(data, 'props.pageProps', {}) || {};
+    const topic =
+      safeGet(data, 'props.pageProps.topic', null) ||
+      safeGet(data, 'props.pageProps.data.topic', null) ||
+      safeGet(data, 'props.pageProps.article', null) ||
+      safeGet(data, 'props.pageProps.data.article', null);
+    if (!topic) return null;
+    const title = topic.title || topic.original_title || topic.headline || '';
+    const author =
+      safeGet(topic, 'user.name', '') ||
+      safeGet(topic, 'author.name', '') ||
+      safeGet(topic, 'user.nickname', '') ||
+      safeGet(topic, 'author', '') ||
+      '';
+    const publishedAt =
+      topic.published_at || topic.created_at || topic.updated_at || topic.publish_time || '';
+    const bodyHtml =
+      topic.body_html ||
+      topic.content_html ||
+      topic.body ||
+      topic.content ||
+      topic.html ||
+      topic.mix_body ||
+      topic.description_html ||
+      '';
+    const cover = topic.cover_image || safeGet(topic, 'link_info.image', '') || '';
+    const imgs = [
+      ...(Array.isArray(topic.images)
+        ? topic.images
+            .map((img) => img?.image_style?.original || img?.url || '')
+            .filter(Boolean)
+        : [])
+    ];
+    imgs.push(...extractImgUrlsFromHtml(bodyHtml));
+    if (cover) imgs.unshift(cover);
+    return { title, author, publishedAt, bodyHtml, images: imgs };
+  } catch {
+    return null;
+  }
+};
+
+const tryFallbackParseByFetchingHtml = async (url) => {
+  const startedAt = Date.now();
+  try {
+    const resp = await axios.get(url, {
+      timeout: 30_000,
+      responseType: 'text',
+      maxContentLength: 8 * 1024 * 1024,
+      maxBodyLength: 8 * 1024 * 1024,
+      proxy: false,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    });
+    const contentType = (resp.headers?.['content-type'] || '').toLowerCase();
+    const html = typeof resp.data === 'string' ? resp.data : String(resp.data || '');
+    if (!html || (!contentType.includes('text/html') && !html.trim().startsWith('<!DOCTYPE'))) return null;
+
+    const jsonLd = tryExtractFromJsonLd(html);
+    const nextData = tryExtractFromNextData(html);
+    const title = clampText((jsonLd?.title || nextData?.title || '').trim(), MAX_TITLE_LENGTH);
+    const author = clampText((jsonLd?.author || nextData?.author || '').trim(), 128);
+    const publishedRaw = (jsonLd?.publishedAt || nextData?.publishedAt || '').trim();
+    const publishedAt = publishedRaw ? formatToPublishedStyle(publishedRaw) : '';
+    const jsonBodyHtml = (jsonLd?.bodyHtml || '').trim();
+    const nextBodyHtml = (nextData?.bodyHtml || '').trim();
+    // LongPort 等站点的 JSON-LD 可能只给 description，而 __NEXT_DATA__ 才有完整正文
+    const bodyHtml =
+      nextBodyHtml && nextBodyHtml.length > Math.max(800, jsonBodyHtml.length * 1.1)
+        ? nextBodyHtml
+        : jsonBodyHtml || nextBodyHtml;
+    const contentText = clampText(htmlToText(bodyHtml || ''), MAX_CONTENT_LENGTH);
+    const images = [
+      ...(jsonLd?.images || []),
+      ...(nextData?.images || []),
+      ...extractImgUrlsFromHtml(bodyHtml || '')
+    ]
+      .map((u) => String(u || '').trim())
+      .filter(Boolean);
+    const uniqImages = [...new Set(images)].slice(0, 80);
+
+    if (!title && contentText.length < 80) return null;
+
+    const hostname = (() => {
+      try {
+        return new URL(url).hostname;
+      } catch {
+        return '';
+      }
+    })();
+    const sourcePlatform = hostname.includes('longport') ? 'LongPort' : hostname || '';
+
+    return {
+      extractedFields: {
+        title,
+        content: contentText,
+        author,
+        published_at: publishedAt,
+        link: url,
+        img_urls: uniqImages,
+        source_platform: sourcePlatform
+      },
+      meta: {
+        provider: 'fallback_html',
+        elapsedMs: Date.now() - startedAt,
+        contentType
+      }
+    };
+  } catch {
+    return null;
+  }
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // 简单判断字符串是否疑似 HTML（例如 Coze 返回了登录页）
 const looksLikeHtml = (text = '') => {
   if (!text || typeof text !== 'string') return false;
@@ -33,6 +278,27 @@ const isAbortError = (err) => {
     msg.includes('socket hang up') ||
     msg.includes('connection reset')
   );
+};
+
+const buildCozeFailurePayload = (err, meta = {}) => {
+  const payload = {
+    ok: false,
+    provider: 'coze',
+    error: {
+      message: err?.message || 'unknown',
+      code: err?.code || null,
+      errno: err?.errno || null,
+      syscall: err?.syscall || null,
+      address: err?.address || null,
+      port: err?.port || null
+    },
+    meta
+  };
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return JSON.stringify({ ok: false, error: { message: String(err?.message || err) }, meta });
+  }
 };
 
 // 简单从正文中推断标题/作者/时间
@@ -76,7 +342,17 @@ const deriveMetaFromContent = (content = '') => {
 // 将日期格式化为与 published_at 一致的样式：YYYY/M/D HH:mm:ss
 const formatToPublishedStyle = (value) => {
   if (!value) return '';
-  const date = new Date(value);
+  let normalized = value;
+  if (typeof value === 'number') {
+    normalized = value < 1e12 ? value * 1000 : value;
+  } else if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (/^\d+$/.test(trimmed)) {
+      const asNum = Number(trimmed);
+      normalized = asNum < 1e12 ? asNum * 1000 : asNum;
+    }
+  }
+  const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) {
     return typeof value === 'string' ? value : '';
   }
@@ -524,6 +800,72 @@ const formatFieldValue = (fieldKey, rawValue, fallbackValue = '') => {
   return { hasValue: false, value: '' };
 };
 
+const DOUBAO_SUMMARY_PROMPT =
+  '请将内容整理为不超过5条的要点，突出文章核心信息，使用简洁的中文有序列表输出。';
+
+const normalizeAiOutput = (raw) => {
+  const text = typeof raw === 'string' ? raw.trim() : '';
+  if (!text) return '';
+  // Remove markdown code fences if any
+  return text
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/```$/i, '')
+    .trim();
+};
+
+const buildSummaryBlockText = (summary) => {
+  const cleaned = sanitizeString(summary || '');
+  if (!cleaned) return '';
+  return `【摘要】\n${cleaned}\n\n`;
+};
+
+const buildKeywordsBlockText = (keywords) => {
+  const list = Array.isArray(keywords)
+    ? keywords.map((k) => sanitizeString(k)).filter(Boolean)
+    : typeof keywords === 'string'
+      ? keywords
+          .split(/[,\n，]/)
+          .map((k) => sanitizeString(k)).filter(Boolean)
+      : [];
+  if (!list.length) return '';
+  return `【关键词】\n${list.join('、')}\n\n`;
+};
+
+const buildSourceBlockText = ({
+  sourceType,
+  sourceUrl,
+  sourcePlatform,
+  author,
+  publishedAt,
+  noteCreatedAt
+}) => {
+  const normalizedType = sanitizeString(sourceType).toLowerCase();
+  const url = sanitizeString(sourceUrl || '');
+  const platform = sanitizeString(sourcePlatform || '');
+  const safeAuthor = sanitizeString(author || '');
+  const safePublished = sanitizeString(publishedAt || '');
+  const safeCreatedAt = sanitizeString(noteCreatedAt || '');
+
+  if (normalizedType !== 'link' && !url && !platform && !safeAuthor && !safePublished && !safeCreatedAt) {
+    return '';
+  }
+
+  const lines = ['【来源】'];
+  if (url) lines.push(`来源链接：${url}`);
+  if (platform) lines.push(`来源平台：${platform}`);
+  if (safeAuthor) lines.push(`作者：${safeAuthor}`);
+  if (safePublished) lines.push(`发布时间：${safePublished}`);
+  if (safeCreatedAt) lines.push(`记录时间：${safeCreatedAt}`);
+  return lines.length > 1 ? `${lines.join('\n')}\n\n` : '';
+};
+
+const buildImageBlockText = (imgUrls) => {
+  const urls = Array.isArray(imgUrls) ? imgUrls : [];
+  const cleaned = urls.map((u) => sanitizeString(u)).filter(Boolean);
+  if (!cleaned.length) return '';
+  return `\n\n【图片】\n${cleaned.join('\n')}`;
+};
+
 const buildComponentDataMap = (
   componentInstances,
   parsedFields,
@@ -567,6 +909,28 @@ const buildComponentDataMap = (
       }
     };
   }
+
+  // 隐藏元数据：用于分析/图表，不在详情页按组件字段展示
+  const normalizedSourceType = sanitizeString(sourceType).toLowerCase() === 'link' ? 'link' : 'manual';
+  const metaImgUrls = Array.isArray(parsedFields?.img_urls)
+    ? parsedFields.img_urls.map((u) => sanitizeString(u)).filter(Boolean)
+    : [];
+  const metaSourceUrl =
+    sanitizeString(parsedFields?.link || parsedFields?.source_url || sourceUrl || '') || null;
+  dataMap.note_meta = {
+    type: 'meta',
+    title: 'note_meta',
+    value: {
+      sourceType: normalizedSourceType,
+      sourceUrl: metaSourceUrl,
+      sourcePlatform: sanitizeString(parsedFields?.source_platform || '') || null,
+      author: sanitizeString(parsedFields?.author || '') || null,
+      publishedAt: sanitizeString(parsedFields?.published_at || '') || null,
+      imgUrls: metaImgUrls,
+      noteType: sanitizeString(parsedFields?.note_type || parsedFields?.noteType || '') || null
+    }
+  };
+
   return dataMap;
 };
 
@@ -600,18 +964,8 @@ const updateNotebookNoteCount = async (db, notebookId) => {
 
 const buildAutoNotebookComponentConfig = () => {
   const baseInstances = [];
-  const defaultFields = [
-    'title',
-    'content',
-    'summary',
-    'keywords',
-    'img_urls',
-    'source_url',
-    'author',
-    'published_at',
-    'note_type',
-    'source_platform'
-  ];
+  // 保持笔记本结构最小化：避免 link/manual 混用导致字段结构不一致
+  const defaultFields = ['title', 'content', 'note_created_at'];
   defaultFields.forEach((fieldKey) => {
     ensureNotebookComponentForField(baseInstances, fieldKey);
   });
@@ -759,6 +1113,7 @@ const selectNotebookWithAI = async ({ db, aiService, parsedFields }) => {
 
 const createNoteFromParsedResult = async ({
   db,
+  aiService,
   notebookId,
   parsedFields,
   historyId,
@@ -776,29 +1131,10 @@ const createNoteFromParsedResult = async ({
     parsedFields && typeof parsedFields === 'object' && !Array.isArray(parsedFields)
       ? parsedFields
       : {};
-  let componentInstances = parseNotebookComponentInstances(notebook.component_config);
-  let mutated = false;
-  Object.keys(NOTE_FIELD_COMPONENTS).forEach((fieldKey) => {
-    if (normalizedFields[fieldKey] !== undefined && normalizedFields[fieldKey] !== null) {
-      const { added } = ensureNotebookComponentForField(componentInstances, fieldKey);
-      if (added) mutated = true;
-    }
-  });
-  ['title', 'content'].forEach((fieldKey) => {
-    const { added } = ensureNotebookComponentForField(componentInstances, fieldKey);
-    if (added) mutated = true;
-  });
-  if (!componentInstances.length) {
-    Object.keys(NOTE_FIELD_COMPONENTS)
-      .slice(0, 3)
-      .forEach((fieldKey) => {
-        const { added } = ensureNotebookComponentForField(componentInstances, fieldKey);
-        if (added) mutated = true;
-      });
-  }
-  if (mutated) {
-    await saveNotebookComponentConfig(db, notebookId, componentInstances);
-  }
+
+  // 不再基于解析结果修改笔记本字段结构，避免同一笔记本里 link/manual 结构不一致
+  const componentInstances = parseNotebookComponentInstances(notebook.component_config);
+
   const componentData = buildComponentDataMap(
     componentInstances,
     normalizedFields,
@@ -809,8 +1145,7 @@ const createNoteFromParsedResult = async ({
   const noteId = generateNoteId();
   const now = new Date().toISOString();
   const resolvedTitle = sanitizeString(normalizedFields.title, '未命名笔记') || '未命名笔记';
-  const resolvedContent =
-    sanitizeString(normalizedFields.content || normalizedFields.summary || '') || null;
+  const baseContent = sanitizeString(normalizedFields.content || normalizedFields.summary || '') || '';
   const sanitizedSourceUrl =
     sanitizeString(normalizedFields.link || normalizedFields.source_url || sourceUrl) || '';
   const sanitizedOriginalUrl =
@@ -820,6 +1155,42 @@ const createNoteFromParsedResult = async ({
     sanitizeString(normalizedFields.note_created_at || normalizedFields.published_at || '') || null;
   const sourcePlatform =
     sanitizeString(normalizedFields.source_platform || '') || null;
+  const imageUrls = Array.isArray(normalizedFields.img_urls)
+    ? normalizedFields.img_urls.map((u) => sanitizeString(u)).filter(Boolean)
+    : [];
+
+  let aiSummary = '';
+  try {
+    const hasContentForSummary = baseContent && baseContent.trim().length >= 30;
+    if (aiService && hasContentForSummary) {
+      const summaryPrompt = `${DOUBAO_SUMMARY_PROMPT}\n\n内容：${baseContent}`;
+      // 优先强制走豆包（若已配置），否则按 AIService 的 providerOrder 兜底
+      const result =
+        aiService.doubaoConfigured && typeof aiService._callDoubaoAPI === 'function'
+          ? await aiService._callDoubaoAPI([{ role: 'user', content: summaryPrompt }], {
+              temperature: 0.7,
+              maxTokens: 500
+            })
+          : await aiService.generateText(summaryPrompt, { temperature: 0.7, maxTokens: 500 });
+      aiSummary = normalizeAiOutput(result);
+    }
+  } catch (err) {
+    console.warn('⚠️ 生成豆包摘要失败，忽略摘要:', err?.message || err);
+  }
+
+  // 除 title/note_type/status 外，其余字段一律写入“内容”组件（中文标签）
+  const summaryBlock = buildSummaryBlockText(aiSummary || normalizedFields.summary || '');
+  const keywordsBlock = buildKeywordsBlockText(normalizedFields.keywords || normalizedFields.tags || []);
+  const sourceBlock = buildSourceBlockText({
+    sourceType,
+    sourceUrl: sanitizedSourceUrl,
+    sourcePlatform,
+    author: sanitizedAuthor,
+    publishedAt: sanitizeString(normalizedFields.published_at || '') || '',
+    noteCreatedAt: sanitizeString(normalizedFields.note_created_at || '') || ''
+  });
+  const imageBlock = buildImageBlockText(imageUrls);
+  const resolvedContentText = `${summaryBlock}${sourceBlock}${keywordsBlock}${baseContent}${imageBlock}`.trim();
 
   await db.run(
     `INSERT INTO notes (
@@ -844,9 +1215,9 @@ const createNoteFromParsedResult = async ({
       noteId,
       notebookId,
       resolvedTitle,
-      resolvedContent,
+      resolvedContentText || null,
       null,
-      null,
+      imageUrls.length ? imageUrls.join('\n') : null,
       sanitizedSourceUrl,
       sourcePlatform,
       sanitizedOriginalUrl,
@@ -1058,13 +1429,33 @@ export function initParseRoutes(db) {
       let parsedSummary = null;
       let parsedFields = {};
       const normalizedSourceUrl = sanitizeSourceUrlValue(cleanedArticleUrl, historyId);
+      const hostname = (() => {
+        try {
+          return new URL(cleanedArticleUrl).hostname || '';
+        } catch {
+          return '';
+        }
+      })();
+      const preferHtmlFallback =
+        hostname.includes('longportapp.') || hostname.includes('longbridge.') || hostname.includes('longport');
+
+      // 某些站点（例如 LongPort）Coze 偶发/持续 ECONNRESET，但网页 HTML 中已包含完整正文（JSON-LD / __NEXT_DATA__）。
+      // 这类站点优先走 HTML 兜底解析，避免用户长时间卡在“解析中”。
+      if (preferHtmlFallback) {
+        const fallback = await tryFallbackParseByFetchingHtml(cleanedArticleUrl);
+        if (fallback?.extractedFields?.content) {
+          parsedContent = JSON.stringify(fallback.extractedFields);
+          responseData = { code: 0, msg: '', data: fallback.extractedFields, fallback: fallback.meta };
+          console.log('✅ 已使用 HTML 兜底解析（跳过 Coze）:', fallback.meta);
+        }
+      }
       
       // 仅使用 Coze Workflow
-      if (COZE_ACCESS_TOKEN && COZE_WORKFLOW_ID) {
+      if (COZE_ACCESS_TOKEN && COZE_WORKFLOW_ID && !parsedContent) {
         const callCozeWorkflowOnce = async () => {
           const cozeApiUrl = `https://api.coze.cn/v1/workflow/run`;
 
-          const parameters = { input: articleUrl.trim() };
+          const parameters = { input: cleanedArticleUrl };
           if (query) parameters.query = query;
 
           const apiPayload = {
@@ -1078,6 +1469,7 @@ export function initParseRoutes(db) {
           console.log(`📦 Workflow ID: ${COZE_WORKFLOW_ID}`);
           console.log(`🔑 使用 ACCESS_TOKEN 前缀: ${COZE_ACCESS_TOKEN.substring(0, 10)}...`);
 
+          const startedAt = Date.now();
           const apiResponse = await axios.post(cozeApiUrl, apiPayload, {
             headers: {
               Authorization: `Bearer ${COZE_ACCESS_TOKEN}`,
@@ -1085,13 +1477,21 @@ export function initParseRoutes(db) {
             },
             responseType: 'json',
             timeout: 300000,
+            // 避免 axios 读取环境代理导致链路不一致
+            proxy: false,
+            httpsAgent: createCozeHttpsAgent(),
             validateStatus: (status) => status < 500
           });
 
           const statusCode = apiResponse.status;
           const contentType = apiResponse.headers['content-type'] || '';
-          console.log(`📊 Workflow 响应状态码: ${statusCode}`);
+          const logId =
+            apiResponse.headers?.['x-tt-logid'] ||
+            apiResponse.headers?.['x-tt-logid'.toLowerCase()] ||
+            apiResponse.headers?.['x-tt-logid'.toUpperCase()];
+          console.log(`📊 Workflow 响应状态码: ${statusCode}（${Date.now() - startedAt}ms）`);
           console.log(`📄 响应 Content-Type: ${contentType}`);
+          if (logId) console.log(`🧾 X-Tt-Logid: ${logId}`);
           
           if (statusCode === 401 || statusCode === 403 || apiResponse.data?.code === 4100) {
             throw new Error(`Coze Workflow 鉴权失败 (${statusCode}): 请检查 COZE_ACCESS_TOKEN 是否有效、是否有 workflow:run 权限，且与 workflow 同一空间`);
@@ -1138,20 +1538,64 @@ export function initParseRoutes(db) {
           }
         };
 
-        for (let attempt = 0; attempt < 2; attempt++) {
+        const maxAttempts = preferHtmlFallback ? 1 : 4;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          const attemptStartedAt = Date.now();
           try {
             await callCozeWorkflowOnce();
             break;
           } catch (apiError) {
             console.error(`❌ Coze Workflow 调用失败(第${attempt + 1}次):`, apiError.message, apiError?.code || '');
+            console.error(`⏱️ 本次失败耗时: ${Date.now() - attemptStartedAt}ms`);
             if (isAbortError(apiError)) {
-              if (attempt === 0) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
+              const backoff = Math.min(800 * Math.pow(2, attempt) + Math.floor(Math.random() * 200), 6000);
+              if (attempt < maxAttempts - 1) {
+                await sleep(backoff);
                 continue;
+              }
+              // 最终失败：尝试用“抓取网页 HTML”做兜底解析（例如 LongPort 某些链接 Coze 会持续 ECONNRESET）
+              const fallback = await tryFallbackParseByFetchingHtml(cleanedArticleUrl);
+              if (fallback?.extractedFields?.content) {
+                parsedContent = JSON.stringify(fallback.extractedFields);
+                responseData = {
+                  code: 0,
+                  msg: '',
+                  data: fallback.extractedFields,
+                  fallback: fallback.meta,
+                  coze_error: buildCozeFailurePayload(apiError, {
+                    workflowId: COZE_WORKFLOW_ID,
+                    attempt: attempt + 1
+                  })
+                };
+                console.warn('⚠️ Coze 失败，已启用 HTML 兜底解析:', fallback.meta);
+                break;
+              }
+
+              // 兜底也失败：落库失败记录，便于排查
+              try {
+                const now = new Date().toISOString();
+                await db.run(
+                  `INSERT INTO article_parse_history
+                   (id, source_url, status, parse_query, coze_response_data, created_at, parsed_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [
+                    historyId,
+                    normalizedSourceUrl || cleanedArticleUrl,
+                    'failed',
+                    query || null,
+                    buildCozeFailurePayload(apiError, { workflowId: COZE_WORKFLOW_ID, attempt: attempt + 1 }),
+                    now,
+                    now,
+                    now
+                  ]
+                );
+              } catch (persistErr) {
+                console.warn('⚠️ 保存 Coze 失败记录到解析历史失败（已忽略）:', persistErr?.message || persistErr);
               }
               return res.status(504).json({
                 success: false,
-                error: 'Coze 请求超时或被中断，请稍后重试'
+                historyId,
+                error: 'Coze 请求超时或被中断（ECONNRESET/socket hang up），请稍后重试'
               });
             }
             if (apiError.response) {
@@ -1927,6 +2371,7 @@ export function initParseRoutes(db) {
       try {
         assignmentResult = await createNoteFromParsedResult({
           db,
+          aiService,
           notebookId: suggestedNotebookId,
           parsedFields: normalizedFields,
           historyId: history.id,
@@ -2192,6 +2637,7 @@ export function initParseRoutes(db) {
         try {
           assignmentResult = await createNoteFromParsedResult({
             db,
+            aiService,
             notebookId: suggestedNotebookId,
             parsedFields,
             historyId,
@@ -2285,9 +2731,29 @@ export function initParseRoutes(db) {
       let parsedSummary = null;
       let parsedFields = {};
       const normalizedSourceUrl = sanitizeSourceUrlValue(cleanedArticleUrl, historyId);
+      const hostname = (() => {
+        try {
+          return new URL(cleanedArticleUrl).hostname || '';
+        } catch {
+          return '';
+        }
+      })();
+      const preferHtmlFallback =
+        hostname.includes('longportapp.') || hostname.includes('longbridge.') || hostname.includes('longport');
+
+      // 某些站点（例如 LongPort）Coze 偶发/持续 ECONNRESET，但网页 HTML 中已包含完整正文（JSON-LD / __NEXT_DATA__）。
+      // 这类站点优先走 HTML 兜底解析，避免用户长时间卡在“解析中”。
+      if (preferHtmlFallback) {
+        const fallback = await tryFallbackParseByFetchingHtml(cleanedArticleUrl);
+        if (fallback?.extractedFields?.content) {
+          parsedContent = JSON.stringify(fallback.extractedFields);
+          responseData = { code: 0, msg: '', data: fallback.extractedFields, fallback: fallback.meta };
+          console.log('✅ 已使用 HTML 兜底解析（跳过 Coze）:', fallback.meta);
+        }
+      }
       
       // 仅使用 Coze Workflow
-      if (COZE_ACCESS_TOKEN && COZE_WORKFLOW_ID) {
+      if (COZE_ACCESS_TOKEN && COZE_WORKFLOW_ID && !parsedContent) {
         const extractCozeAnswer = (data) => {
           if (!data) return '';
           const messages = data.messages || data.data || [];
@@ -2322,6 +2788,7 @@ export function initParseRoutes(db) {
           console.log(`📦 Workflow ID: ${COZE_WORKFLOW_ID}`);
           console.log(`🔑 使用 ACCESS_TOKEN 前缀: ${COZE_ACCESS_TOKEN.substring(0, 10)}...`);
 
+          const startedAt = Date.now();
           const apiResponse = await axios.post(cozeApiUrl, apiPayload, {
             headers: {
               Authorization: `Bearer ${COZE_ACCESS_TOKEN}`,
@@ -2329,13 +2796,20 @@ export function initParseRoutes(db) {
             },
             responseType: 'json',
             timeout: 300000,
+            proxy: false,
+            httpsAgent: createCozeHttpsAgent(),
             validateStatus: (status) => status < 500
           });
 
           const statusCode = apiResponse.status;
           const contentType = apiResponse.headers['content-type'] || '';
-          console.log(`📊 Workflow 响应状态码: ${statusCode}`);
+          const logId =
+            apiResponse.headers?.['x-tt-logid'] ||
+            apiResponse.headers?.['x-tt-logid'.toLowerCase()] ||
+            apiResponse.headers?.['x-tt-logid'.toUpperCase()];
+          console.log(`📊 Workflow 响应状态码: ${statusCode}（${Date.now() - startedAt}ms）`);
           console.log(`📄 响应 Content-Type: ${contentType}`);
+          if (logId) console.log(`🧾 X-Tt-Logid: ${logId}`);
           
           if (statusCode === 401 || statusCode === 403 || apiResponse.data?.code === 4100) {
             throw new Error(`Coze Workflow 鉴权失败 (${statusCode}): 请检查 COZE_ACCESS_TOKEN 是否有效、是否有 workflow:run 权限，且与 workflow 同一空间`);
@@ -2361,7 +2835,9 @@ export function initParseRoutes(db) {
           };
         };
 
-        for (let attempt = 0; attempt < 2; attempt++) {
+        const maxAttempts = preferHtmlFallback ? 1 : 4;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          const attemptStartedAt = Date.now();
           try {
             const result = await callCozeWorkflowOnce();
             parsedContent = result.answer || parsedContent;
@@ -2371,14 +2847,58 @@ export function initParseRoutes(db) {
             break;
           } catch (apiError) {
             console.error(`❌ Coze API调用失败(第${attempt + 1}次):`, apiError.message, apiError?.code || '');
+            console.error(`⏱️ 本次失败耗时: ${Date.now() - attemptStartedAt}ms`);
             if (isAbortError(apiError)) {
-              if (attempt === 0) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
+              const backoff = Math.min(800 * Math.pow(2, attempt) + Math.floor(Math.random() * 200), 6000);
+              if (attempt < maxAttempts - 1) {
+                await sleep(backoff);
                 continue;
               }
+
+              // 最终失败：尝试用“抓取网页 HTML”做兜底解析（例如 LongPort 某些链接 Coze 会持续 ECONNRESET）
+              const fallback = await tryFallbackParseByFetchingHtml(cleanedArticleUrl);
+              if (fallback?.extractedFields?.content) {
+                parsedContent = JSON.stringify(fallback.extractedFields);
+                responseData = {
+                  code: 0,
+                  msg: '',
+                  data: fallback.extractedFields,
+                  fallback: fallback.meta,
+                  coze_error: buildCozeFailurePayload(apiError, {
+                    workflowId: COZE_WORKFLOW_ID,
+                    attempt: attempt + 1
+                  })
+                };
+                console.warn('⚠️ Coze 失败，已启用 HTML 兜底解析:', fallback.meta);
+                break;
+              }
+
+              // 兜底也失败：落库一条失败记录，便于排查
+              try {
+                const now = new Date().toISOString();
+                await db.run(
+                  `INSERT INTO article_parse_history
+                   (id, source_url, status, parse_query, coze_response_data, created_at, parsed_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [
+                    historyId,
+                    normalizedSourceUrl || cleanedArticleUrl,
+                    'failed',
+                    query || null,
+                    buildCozeFailurePayload(apiError, { workflowId: COZE_WORKFLOW_ID, attempt: attempt + 1 }),
+                    now,
+                    now,
+                    now
+                  ]
+                );
+              } catch (persistErr) {
+                console.warn('⚠️ 保存 Coze 失败记录到解析历史失败（已忽略）:', persistErr?.message || persistErr);
+              }
+
               return res.status(504).json({
                 success: false,
-                error: 'Coze 请求超时或被中断，请稍后重试'
+                historyId,
+                error: 'Coze 请求超时或被中断（ECONNRESET/socket hang up），请稍后重试'
               });
             }
             if (apiError.response) {
@@ -2704,6 +3224,7 @@ export function initParseRoutes(db) {
         try {
           assignmentResult = await createNoteFromParsedResult({
             db,
+            aiService,
             notebookId: suggestedNotebookId,
             parsedFields,
             historyId,

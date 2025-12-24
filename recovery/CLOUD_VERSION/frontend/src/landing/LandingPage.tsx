@@ -1,10 +1,16 @@
-import React from 'react';
+import React, { useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import LandingHeroParseSection from '../components/LandingHeroParseSection';
-import TopNavigation from '../components/TopNavigation';
+import { useAuth } from '../auth/AuthContext';
+import UserAvatarMenu from '../components/UserAvatarMenu';
 
 const LandingPage: React.FC = () => {
   const navigate = useNavigate();
+  const { user, openAuthModal } = useAuth();
+  const scrollToFeatures = useCallback(() => {
+    if (typeof window === 'undefined') return;
+    document.getElementById('features')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, []);
 
   const features = [
     {
@@ -61,11 +67,47 @@ const LandingPage: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-[#eef6fd] pt-0 pb-4">
-      <TopNavigation />
+      {/* Landing Navigation（与 /workspace 顶部导航互相独立） */}
+      <div className="sticky top-0 z-50 border-b border-[#e0f1fb] bg-[#f8fcff]/80 backdrop-blur">
+        <div className="mx-auto w-full max-w-[1400px] px-[10px]">
+          <nav className="mx-auto flex h-[72px] w-full max-w-[1200px] flex-wrap items-center px-6 py-0">
+            <div className="flex items-center">
+              <div className="w-[9ch]">
+                <div className="flex justify-between text-lg font-semibold text-slate-900">
+                  {'回响笔记'.split('').map((char, index) => (
+                    <span key={`${char}-${index}`}>{char}</span>
+                  ))}
+                </div>
+                <div className="flex justify-between whitespace-nowrap text-xs text-slate-400">
+                  {'Echo Notes'.split('').map((char, index) => (
+                    <span key={`${char}-${index}`}>{char === ' ' ? '\u00A0' : char}</span>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="ml-auto flex items-center gap-10">
+              <div className="hidden items-center gap-10 text-sm font-medium text-slate-600 lg:flex">
+                {['产品功能', '使用指南', '联系我们'].map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    onClick={item === '产品功能' ? scrollToFeatures : undefined}
+                    className="transition-colors hover:text-[#06c3a8]"
+                  >
+                    {item}
+                  </button>
+                ))}
+              </div>
+              <UserAvatarMenu variant="landing" />
+            </div>
+          </nav>
+        </div>
+      </div>
 
       <div className="mx-auto w-full max-w-[1400px] px-[10px]">
         {/* Hero */}
-        <section className="min-h-[calc(100vh-56px)] pb-[64px]">
+        <section className="min-h-[calc(100vh-72px)] pb-[64px]">
           {/* 这里 pt 你原来的值保留，避免你说的“顶/不顶”反复 */}
           <div className="mx-auto w-full max-w-[1200px] px-6 pt-[50px] xl:pt-[40px]">
             {/* 关键：不要再用左列 -mt；用 grid 整体上移，让文字+插画一起动 */}
@@ -80,12 +122,12 @@ const LandingPage: React.FC = () => {
                 <p className="mb-[30px] text-[22px] font-normal leading-[1.7] tracking-[1.5px] text-slate-600 md:text-[24px]">
                   要点提炼 ｜ 标签归类 ｜ 图表总结
                 </p>
-                <div className="flex flex-wrap gap-4">
+                <div className="flex flex-wrap items-center gap-4">
                   <button
-                    onClick={() => navigate('/workspace')}
+                    onClick={() => (user ? navigate('/workspace') : openAuthModal('login'))}
                     className="w-full rounded-full bg-[#06c3a8] px-8 py-4 text-lg font-semibold tracking-[1.5px] text-white shadow-xl shadow-[#9ee3d8] transition hover:bg-[#04b094] sm:w-auto"
                   >
-                    立即试用
+                    {user ? '开始记录' : '立即试用'}
                   </button>
                 </div>
               </div>

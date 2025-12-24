@@ -262,3 +262,16 @@ pre[data-line-numbers]::before {
   background: #e0ffe0;
   color: #047857;
 }
+
+/* === TipTap / ProseMirror placeholder === */
+.ProseMirror p.is-editor-empty:first-child::before,
+.ProseMirror p.is-empty:first-child::before,
+.ProseMirror li.is-editor-empty:first-child::before,
+.ProseMirror li.is-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  color: #94a3b8;
+  pointer-events: none;
+  height: 0;
+  white-space: pre-wrap;
+}

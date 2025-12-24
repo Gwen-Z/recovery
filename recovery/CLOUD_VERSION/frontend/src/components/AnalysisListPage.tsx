@@ -1,21 +1,185 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { createPortal } from 'react-dom';
 import apiClient, { getNotebooks, Notebook as ApiNotebook } from '../apiClient';
 import { AnalysisResult, NotebookType } from '../types/Analysis';
 import { getFullAnalysisUrl } from '../utils/analysisId';
 
+type AnalysisFilterType = NotebookType | 'all' | 'unknown';
+
+const ANALYSIS_V2_HISTORY_STORAGE_KEY = 'analysisV2.history.v1';
+
+const getErrorMessage = (err: unknown, fallback: string) => {
+  if (!err) return fallback;
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === 'object' && err && 'message' in err) {
+    const msg = (err as any).message;
+    if (typeof msg === 'string' && msg.trim()) return msg;
+  }
+  if (typeof err === 'string' && err.trim()) return err;
+  return fallback;
+};
+
+const copyTextToClipboard = async (text: string) => {
+  const payload = String(text || '');
+  if (!payload) return false;
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(payload);
+      return true;
+    }
+  } catch {
+    // ignore and fallback
+  }
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = payload;
+    textarea.setAttribute('readonly', 'true');
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    textarea.style.top = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+};
+
+const normalizeNotebookType = (value: unknown): AnalysisFilterType => {
+  const t = String(value || '').trim();
+  if (t === 'mood') return 'mood';
+  if (t === 'life') return 'life';
+  if (t === 'study') return 'study';
+  if (t === 'work') return 'work';
+  if (t === 'finance') return 'finance';
+  if (t === 'ai') return 'ai';
+  if (t === 'custom') return 'custom';
+  return 'unknown';
+};
+
+const getNotebookIdFromAnalysis = (analysis: AnalysisResult) =>
+  analysis.metadata?.dataSource?.notebookId || (analysis as any).notebookId || '';
+
+const getAnalysisUpdatedAtMs = (analysis: AnalysisResult) => {
+  const updatedAt =
+    (analysis as any).metadata?.updatedAt ||
+    (analysis as any).updatedAt ||
+    analysis.metadata?.createdAt ||
+    (analysis as any).createdAt ||
+    '';
+  const ms = updatedAt ? new Date(String(updatedAt)).getTime() : 0;
+  return Number.isFinite(ms) ? ms : 0;
+};
+
+type AnalysisV2HistoryRecord = {
+  id: string;
+  notebookId: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  request?: {
+    preset?: string;
+    from?: string;
+    to?: string;
+    noteIds?: string[];
+  };
+  result?: {
+    analysisId?: string;
+    notebookType?: string;
+    meta?: { recordCount?: number };
+  };
+};
+
+const loadAnalysisV2History = (): AnalysisV2HistoryRecord[] => {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(ANALYSIS_V2_HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item) => item && typeof item === 'object')
+      .map((item) => {
+        const record = item as any;
+        return {
+          id: String(record.id || ''),
+          notebookId: String(record.notebookId || ''),
+          title: String(record.title || ''),
+          createdAt: Number(record.createdAt || Date.now()),
+          updatedAt: Number(record.updatedAt || Date.now()),
+          request: record.request,
+          result: record.result
+        } as AnalysisV2HistoryRecord;
+      })
+      .filter((item) => Boolean(item.id) && Boolean(item.notebookId));
+  } catch {
+    return [];
+  }
+};
+
+const buildAnalysesFromV2History = (history: AnalysisV2HistoryRecord[]): AnalysisResult[] => {
+  const latestByNotebook = new Map<string, AnalysisV2HistoryRecord>();
+  for (const item of history) {
+    const notebookId = String(item.notebookId || '');
+    if (!notebookId) continue;
+    const existing = latestByNotebook.get(notebookId);
+    if (!existing || Number(item.updatedAt || 0) >= Number(existing.updatedAt || 0)) {
+      latestByNotebook.set(notebookId, item);
+    }
+  }
+
+  return Array.from(latestByNotebook.values()).map((record) => {
+    const createdAtIso = new Date(Number(record.createdAt || Date.now())).toISOString();
+    const updatedAtIso = new Date(Number(record.updatedAt || record.createdAt || Date.now())).toISOString();
+    const noteIds = Array.isArray(record.request?.noteIds) ? record.request?.noteIds : [];
+    const recordCount = Number((record.result as any)?.meta?.recordCount || 0);
+    const analysisId = String((record.result as any)?.analysisId || record.id || '');
+    return {
+      id: analysisId,
+      notebookId: record.notebookId,
+      notebookType: (record.result as any)?.notebookType,
+      mode: 'ai',
+      selectedAnalysisComponents: ['chart', 'insight'],
+      analysisData: {
+        title: record.title,
+        meta: (record.result as any)?.meta,
+        selectedNotes: {
+          notebookId: record.notebookId,
+          noteIds,
+          dateRange: record.request?.from && record.request?.to ? { from: record.request.from, to: record.request.to } : null
+        }
+      },
+      metadata: {
+        createdAt: createdAtIso,
+        updatedAt: updatedAtIso,
+        dataSource: {
+          notebookId: record.notebookId,
+          noteIds,
+          recordCount
+        }
+      }
+    } as any as AnalysisResult;
+  });
+};
+
 // 分析结果项组件
 const AnalysisItem = ({
   analysis,
   onAnalysisClick,
   onShare,
-  notebookName
+  notebookName,
+  onNotify,
+  onDelete
 }: {
   analysis: AnalysisResult;
   onAnalysisClick: (analysisId: string) => void;
   onShare?: (analysis: AnalysisResult) => void;
   notebookName?: string;
+  onNotify?: (message: string) => void;
+  onDelete?: (analysis: AnalysisResult) => void;
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -29,6 +193,10 @@ const AnalysisItem = ({
 
   // 安全获取字段辅助
   const getNoteCount = () => {
+    const fromRecordCount = (analysis.metadata as any)?.dataSource?.recordCount;
+    if (typeof fromRecordCount === 'number' && Number.isFinite(fromRecordCount) && fromRecordCount > 0) {
+      return fromRecordCount;
+    }
     const fromMeta = analysis.metadata?.dataSource?.noteIds?.length;
     if (typeof fromMeta === 'number') return fromMeta;
     const fromProcessedMeta = (analysis as any).analysisData?.componentConfigs?.chart?.processedData?.metadata?.noteCount;
@@ -69,17 +237,8 @@ const AnalysisItem = ({
       return;
     }
     const url = getFullAnalysisUrl(analysis.id);
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(url);
-        alert('分析链接已复制到剪贴板');
-      } else {
-        prompt('复制分析页面链接', url);
-      }
-    } catch (err) {
-      console.error('复制链接失败:', err);
-      alert('复制失败，请手动复制地址栏链接');
-    }
+    const ok = await copyTextToClipboard(url);
+    if (!ok) prompt('复制分析页面链接', url);
   };
 
   const createdAt = getCreatedAt();
@@ -166,13 +325,18 @@ const AnalysisItem = ({
                       e.preventDefault();
                       e.stopPropagation();
                       setMenuOpen(false);
+                      if (onDelete) {
+                        onDelete(analysis);
+                        return;
+                      }
                       if (window.confirm('确定删除这个分析结果吗？')) {
                         try {
                           await apiClient.delete(`/api/analysis/${analysis.id}`);
                           window.dispatchEvent(new Event('analysis:refresh'));
                         } catch (error) {
                           console.error('删除失败:', error);
-                          alert('删除失败，请重试');
+                          if (onNotify) onNotify('删除失败，请重试');
+                          else console.warn('删除失败，请重试');
                         }
                       }
                     }}
@@ -204,8 +368,13 @@ const AnalysisListPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
-  const [filterType, setFilterType] = useState<NotebookType | 'all'>('all');
+  const [filterType, setFilterType] = useState<AnalysisFilterType>('all');
   const [notebookNames, setNotebookNames] = useState<Record<string, string>>({});
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
+  const mountedRef = useRef(true);
+  const analysesRequestIdRef = useRef(0);
+  const notebookNamesRequestIdRef = useRef(0);
   
   // 下拉框状态管理
   const [typeDropdownOpen, setTypeDropdownOpen] = useState(false);
@@ -214,43 +383,53 @@ const AnalysisListPage: React.FC = () => {
   const typeMenuRef = useRef<HTMLDivElement | null>(null);
   const [typeMenuPos, setTypeMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
 
-  // 获取分析列表
-  const fetchAnalyses = async () => {
+  const showNotice = useCallback((message: string) => {
+    setNotice(message);
+    if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => {
+      setNotice(null);
+      noticeTimerRef.current = null;
+    }, 1600);
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (noticeTimerRef.current) {
+        window.clearTimeout(noticeTimerRef.current);
+        noticeTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // 获取分析列表（基于 /analysis/v2 的本地历史）
+  const fetchAnalyses = useCallback(async () => {
+    const requestId = (analysesRequestIdRef.current += 1);
     try {
       setLoading(true);
       setError(null);
-      const response = await apiClient.get('/api/analysis');
-      console.log('📊 [AnalysisListPage] API 响应:', response.data);
-      
-      if (response.data && response.data.success) {
-        const data = response.data.data || [];
-        console.log('📊 [AnalysisListPage] 获取到分析列表:', data.length, '条');
-        setAnalyses(data);
-      } else {
-        const errorMessage = response.data?.message || '获取分析列表失败';
-        console.error('📊 [AnalysisListPage] API 返回失败:', errorMessage);
-        setError(errorMessage);
-      }
-    } catch (error: any) {
-      console.error('📊 [AnalysisListPage] 获取分析列表失败:', error);
-      const errorMessage = error?.response?.data?.message 
-        || error?.message 
-        || '无法连接到服务器，请检查网络连接';
-      console.error('📊 [AnalysisListPage] 错误详情:', {
-        message: errorMessage,
-        status: error?.response?.status,
-        data: error?.response?.data
-      });
+      const history = loadAnalysisV2History();
+      const list = buildAnalysesFromV2History(history);
+      if (!mountedRef.current || requestId !== analysesRequestIdRef.current) return;
+      setAnalyses(list);
+    } catch (err: unknown) {
+      console.error('[AnalysisListPage] 读取分析历史失败:', err);
+      if (!mountedRef.current || requestId !== analysesRequestIdRef.current) return;
+      const errorMessage = getErrorMessage(err, '读取分析历史失败');
       setError(errorMessage);
     } finally {
+      if (!mountedRef.current || requestId !== analysesRequestIdRef.current) return;
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     const loadNotebookNames = async () => {
+      const requestId = (notebookNamesRequestIdRef.current += 1);
       try {
         const notebooks: ApiNotebook[] = await getNotebooks();
+        if (!mountedRef.current || requestId !== notebookNamesRequestIdRef.current) return;
         const map: Record<string, string> = {};
         notebooks.forEach((notebook) => {
           if (!notebook?.notebook_id) return;
@@ -267,26 +446,42 @@ const AnalysisListPage: React.FC = () => {
 
   useEffect(() => {
     fetchAnalyses();
-    
-    // 监听刷新事件
-    const handleRefresh = () => {
-      fetchAnalyses();
-    };
-    
-    window.addEventListener('analysis:refresh', handleRefresh);
+    window.addEventListener('analysis:refresh', fetchAnalyses);
     return () => {
-      window.removeEventListener('analysis:refresh', handleRefresh);
+      window.removeEventListener('analysis:refresh', fetchAnalyses);
     };
-  }, []);
+  }, [fetchAnalyses]);
+
+  const deleteHistoryByNotebookId = useCallback(
+    (targetNotebookId: string) => {
+      if (typeof window === 'undefined') return;
+      if (!targetNotebookId) return;
+      if (!window.confirm('确定删除该笔记本的所有分析历史吗？')) return;
+      try {
+        const history = loadAnalysisV2History();
+        const next = history.filter((item) => String(item.notebookId) !== String(targetNotebookId));
+        window.localStorage.setItem(ANALYSIS_V2_HISTORY_STORAGE_KEY, JSON.stringify(next));
+        showNotice('已删除分析历史');
+        window.dispatchEvent(new Event('analysis:refresh'));
+      } catch (err) {
+        console.error('[AnalysisListPage] 删除分析历史失败:', err);
+        showNotice('删除失败，请重试');
+      }
+    },
+    [showNotice]
+  );
 
   // 下拉框定位逻辑
   const updateTypeMenuPos = useCallback(() => {
     if (!typeTriggerRef.current) return;
     const rect = typeTriggerRef.current.getBoundingClientRect();
+    const padding = 12;
+    const width = rect.width;
+    const maxLeft = typeof window !== 'undefined' ? Math.max(padding, window.innerWidth - width - padding) : rect.left;
     setTypeMenuPos({
       top: rect.bottom + 8,
-      left: rect.left,
-      width: rect.width
+      left: Math.min(Math.max(rect.left, padding), maxLeft),
+      width
     });
   }, []);
 
@@ -317,34 +512,89 @@ const AnalysisListPage: React.FC = () => {
       setTypeMenuPos(null);
       return;
     }
-    updateTypeMenuPos();
-    const handler = () => updateTypeMenuPos();
-    window.addEventListener('resize', handler);
-    window.addEventListener('scroll', handler, true);
+    let rafId: number | null = null;
+    const scheduleUpdate = () => {
+      if (rafId !== null) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        updateTypeMenuPos();
+      });
+    };
+    scheduleUpdate();
+    window.addEventListener('resize', scheduleUpdate);
+    window.addEventListener('scroll', scheduleUpdate, true);
     return () => {
-      window.removeEventListener('resize', handler);
-      window.removeEventListener('scroll', handler, true);
+      window.removeEventListener('resize', scheduleUpdate);
+      window.removeEventListener('scroll', scheduleUpdate, true);
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+        rafId = null;
+      }
     };
   }, [typeDropdownOpen, updateTypeMenuPos]);
 
   // 类型选项
-  const typeOptions: { value: NotebookType | 'all'; label: string }[] = [
+  const typeOptions: { value: AnalysisFilterType; label: string }[] = [
     { value: 'all', label: '所有类型' },
     { value: 'mood', label: '心情分析' },
     { value: 'life', label: '生活分析' },
     { value: 'study', label: '学习分析' },
     { value: 'work', label: '工作分析' },
+    { value: 'finance', label: '财经分析' },
+    { value: 'ai', label: 'AI 分析' },
+    { value: 'custom', label: '自定义' },
+    { value: 'unknown', label: '未分类' },
   ];
 
+  // 每个 notebook 只展示 1 条（取最新的一条）
+  const uniqueAnalyses = useMemo(() => {
+    const map = new Map<string, AnalysisResult>();
+    for (const item of analyses) {
+      const notebookId = getNotebookIdFromAnalysis(item);
+      const key = notebookId ? `nb:${notebookId}` : `ana:${item.id}`;
+      const existing = map.get(key);
+      if (!existing) {
+        map.set(key, item);
+        continue;
+      }
+      if (getAnalysisUpdatedAtMs(item) >= getAnalysisUpdatedAtMs(existing)) {
+        map.set(key, item);
+      }
+    }
+    return Array.from(map.values()).sort((a, b) => getAnalysisUpdatedAtMs(b) - getAnalysisUpdatedAtMs(a));
+  }, [analyses]);
+
   // 过滤分析结果
-  const filteredAnalyses = analyses.filter(analysis => {
-    const notebookType = analysis.notebookType || 'mood';
-    const matchesSearch =
-      analysis.id.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      notebookType.toLowerCase().includes(searchTerm.toLowerCase());
-    const matchesFilter = filterType === 'all' || notebookType === filterType;
-    return matchesSearch && matchesFilter;
-  });
+  const filteredAnalyses = useMemo(() => {
+    const query = searchTerm.trim().toLowerCase();
+    return uniqueAnalyses.filter((analysis) => {
+      const notebookType = normalizeNotebookType(analysis.notebookType);
+      const rawNotebookId = getNotebookIdFromAnalysis(analysis);
+      if (!rawNotebookId) return false;
+      const resolvedName = rawNotebookId ? notebookNames[rawNotebookId] : '';
+      const matchesSearch =
+        !query ||
+        analysis.id.toLowerCase().includes(query) ||
+        notebookType.toLowerCase().includes(query) ||
+        String(resolvedName || '').toLowerCase().includes(query);
+      const matchesFilter = filterType === 'all' || notebookType === filterType;
+      return matchesSearch && matchesFilter;
+    });
+  }, [uniqueAnalyses, notebookNames, filterType, searchTerm]);
+
+  const handleShareAnalysis = useCallback(
+    async (analysis: AnalysisResult) => {
+      const rawNotebookId = getNotebookIdFromAnalysis(analysis);
+      const url = rawNotebookId ? `${window.location.origin}/analysis/v2/${rawNotebookId}` : getFullAnalysisUrl(analysis.id);
+      const ok = await copyTextToClipboard(url);
+      if (ok) {
+        showNotice('分析链接已复制');
+        return;
+      }
+      prompt('复制分析页面链接', url);
+    },
+    [showNotice]
+  );
 
   if (loading) {
     return (
@@ -376,6 +626,11 @@ const AnalysisListPage: React.FC = () => {
   return (
     <div className="min-h-screen bg-transparent">
       <div className="max-w-6xl mx-auto px-4 pt-0 pb-8">
+        {notice && (
+          <div className="mb-4 rounded-xl border border-[#d4f3ed] bg-white/80 px-4 py-2 text-sm text-[#0a917a] shadow-sm">
+            {notice}
+          </div>
+        )}
         {/* 搜索和过滤 */}
         <div className="relative mb-10">
           <div className="rounded-2xl border border-slate-200/60 bg-white/70 shadow-sm">
@@ -479,17 +734,16 @@ const AnalysisListPage: React.FC = () => {
                   新建分析
                 </button>
               </div>
-            </div>
+	            </div>
+		          </div>
+		        </div>
+		
+		          <div className="absolute -bottom-6 right-6 text-xs text-gray-400">
+		            共 {filteredAnalyses.length} 个分析
+		          </div>
+	        </div>
 
-            </div>
-          </div>
-
-          <div className="absolute -bottom-6 right-6 text-xs text-gray-400">
-            共 {filteredAnalyses.length} 个分析 · 总计 {analyses.length} 个
-          </div>
-        </div>
-
-        {/* 分析结果列表 */}
+	        {/* 分析结果列表 */}
         <div className="space-y-4">
           {filteredAnalyses.map(analysis => {
             const rawNotebookId = analysis.metadata?.dataSource?.notebookId
@@ -502,6 +756,12 @@ const AnalysisListPage: React.FC = () => {
                 key={analysis.id} 
                 analysis={analysis}
                 notebookName={resolvedName}
+                onNotify={showNotice}
+                onDelete={(item) => {
+                  const rawNotebookId = getNotebookIdFromAnalysis(item);
+                  if (!rawNotebookId) return;
+                  deleteHistoryByNotebookId(rawNotebookId);
+                }}
                 onAnalysisClick={() => {
                   if (rawNotebookId) {
                     navigate(`/analysis/v2/${rawNotebookId}`);
@@ -510,16 +770,7 @@ const AnalysisListPage: React.FC = () => {
                     navigate(`/analysis/${analysis.id}`);
                   }
                 }}
-                onShare={(currentAnalysis) => {
-                  const url = getFullAnalysisUrl(currentAnalysis.id);
-                  if (navigator.clipboard && navigator.clipboard.writeText) {
-                    navigator.clipboard.writeText(url)
-                      .then(() => alert('分析链接已复制到剪贴板'))
-                      .catch(() => alert('复制失败，请手动复制地址栏链接'));
-                  } else {
-                    prompt('复制分析页面链接', url);
-                  }
-                }}
+                onShare={handleShareAnalysis}
 	              />
 	            );
 	          })}

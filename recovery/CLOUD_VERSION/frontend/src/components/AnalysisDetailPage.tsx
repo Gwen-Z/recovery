@@ -1,9 +1,74 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import apiClient from '../apiClient';
 import { AnalysisResult } from '../types/Analysis';
 import DynamicAnalysisResult from './DynamicAnalysisResult';
-import { getShortAnalysisId } from '../utils/analysisId';
+import { getFullAnalysisUrl, getShortAnalysisId } from '../utils/analysisId';
+
+const toLocalYmd = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const toLocalYmdFromUnknown = (value: unknown) => {
+  if (!value) return '';
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+    if (trimmed.length >= 10 && /^\d{4}-\d{2}-\d{2}/.test(trimmed)) return trimmed.slice(0, 10);
+    const parsed = new Date(trimmed);
+    if (!Number.isNaN(parsed.getTime())) return toLocalYmd(parsed);
+    return '';
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const ms = value < 1e12 ? value * 1000 : value;
+    const parsed = new Date(ms);
+    if (!Number.isNaN(parsed.getTime())) return toLocalYmd(parsed);
+    return '';
+  }
+  return '';
+};
+
+const getErrorMessage = (err: unknown, fallback: string) => {
+  if (!err) return fallback;
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === 'object' && err && 'message' in err) {
+    const msg = (err as any).message;
+    if (typeof msg === 'string' && msg.trim()) return msg;
+  }
+  if (typeof err === 'string' && err.trim()) return err;
+  return fallback;
+};
+
+const copyTextToClipboard = async (text: string) => {
+  const payload = String(text || '');
+  if (!payload) return false;
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(payload);
+      return true;
+    }
+  } catch {
+    // ignore and fallback
+  }
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = payload;
+    textarea.setAttribute('readonly', 'true');
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    textarea.style.top = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+};
 
 interface AnalysisDetailPageProps {
   analysisIdOverride?: string | null;
@@ -21,8 +86,31 @@ const AnalysisDetailPage: React.FC<AnalysisDetailPageProps> = ({ analysisIdOverr
   const [fromDate, setFromDate] = useState<string>('');
   const [toDate, setToDate] = useState<string>('');
   const [appliedRange, setAppliedRange] = useState<{ from?: string; to?: string }>({});
-  const [hasTriedFallback, setHasTriedFallback] = useState(false);
-  
+  const requestIdRef = useRef(0);
+  const mountedRef = useRef(true);
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
+
+  const showNotice = useCallback((message: string) => {
+    setNotice(message);
+    if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => {
+      setNotice(null);
+      noticeTimerRef.current = null;
+    }, 1600);
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (noticeTimerRef.current) {
+        window.clearTimeout(noticeTimerRef.current);
+        noticeTimerRef.current = null;
+      }
+    };
+  }, []);
+
   const notebookName = useMemo(() => {
     if (notebookNameOverride) return notebookNameOverride.trim();
     if (!analysis) return '';
@@ -41,38 +129,43 @@ const AnalysisDetailPage: React.FC<AnalysisDetailPageProps> = ({ analysisIdOverr
     );
   }, [analysis]);
 
-  const inferFallbackType = () => {
-    if (analysisId === 'mood' || notebookName?.includes('心情')) return 'mood';
-    if (analysisId === 'finance' || notebookName?.includes('财')) return 'finance';
-    if (analysisId === 'work' || notebookName?.includes('工作')) return 'work';
-    if (analysisId === 'study' || notebookName?.includes('学习')) return 'study';
-    return '';
-  };
+  const inferFallbackType = useCallback(
+    (id: string) => {
+      const nameHint = (notebookNameOverride || '').trim();
+      if (id === 'mood' || nameHint.includes('心情')) return 'mood';
+      if (id === 'finance' || nameHint.includes('财')) return 'finance';
+      if (id === 'work' || nameHint.includes('工作')) return 'work';
+      if (id === 'study' || nameHint.includes('学习')) return 'study';
+      return '';
+    },
+    [notebookNameOverride]
+  );
 
   // 获取分析详情
-  const fetchAnalysisDetail = async () => {
+  const fetchAnalysisDetail = useCallback(async () => {
     if (!analysisId) {
-      console.warn('⚠️ [AnalysisDetailPage] 分析ID不存在');
       setError('分析ID不存在');
       setLoading(false);
       return;
     }
 
+    const requestId = (requestIdRef.current += 1);
     try {
-      console.log('🔄 [AnalysisDetailPage] 开始获取分析详情:', analysisId);
+      setAnalysis(null);
       setLoading(true);
+      setError(null);
       const response = await apiClient.get(`/api/analysis/${analysisId}`);
-      console.log('✅ [AnalysisDetailPage] 获取分析详情响应:', response?.data?.success ? '成功' : '失败', response?.data);
+      if (!mountedRef.current || requestId !== requestIdRef.current) return;
       
       if (response.data.success) {
         setAnalysis(response.data.data);
         setError(null);
       } else {
-        const fallbackType = inferFallbackType();
-        if (fallbackType && !hasTriedFallback) {
-          setHasTriedFallback(true);
+        const fallbackType = inferFallbackType(analysisId);
+        if (fallbackType) {
           try {
             const fallbackResp = await apiClient.get(`/api/analysis/${fallbackType}`);
+            if (!mountedRef.current || requestId !== requestIdRef.current) return;
             if (fallbackResp.data?.success) {
               setAnalysis(fallbackResp.data.data);
               setError(null);
@@ -82,15 +175,16 @@ const AnalysisDetailPage: React.FC<AnalysisDetailPageProps> = ({ analysisIdOverr
             console.error('获取分析详情失败（fallback）:', fallbackErr);
           }
         }
-        setError(response.data.message || '获取分析详情失败');
+        setError(String(response.data.message || '获取分析详情失败'));
       }
-    } catch (error: any) {
-      console.error('获取分析详情失败:', error?.message || error);
-      const fallbackType = inferFallbackType();
-      if (fallbackType && !hasTriedFallback) {
-        setHasTriedFallback(true);
+    } catch (err: unknown) {
+      console.error('获取分析详情失败:', err);
+      if (!mountedRef.current || requestId !== requestIdRef.current) return;
+      const fallbackType = inferFallbackType(analysisId);
+      if (fallbackType) {
         try {
           const fallbackResp = await apiClient.get(`/api/analysis/${fallbackType}`);
+          if (!mountedRef.current || requestId !== requestIdRef.current) return;
           if (fallbackResp.data?.success) {
             setAnalysis(fallbackResp.data.data);
             setError(null);
@@ -100,16 +194,16 @@ const AnalysisDetailPage: React.FC<AnalysisDetailPageProps> = ({ analysisIdOverr
           console.error('获取分析详情失败（fallback）:', fallbackErr);
         }
       }
-      setError('获取分析详情失败');
+      setError(getErrorMessage(err, '获取分析详情失败'));
     } finally {
+      if (!mountedRef.current || requestId !== requestIdRef.current) return;
       setLoading(false);
     }
-  };
+  }, [analysisId, inferFallbackType]);
 
   useEffect(() => {
-    setHasTriedFallback(false);
     fetchAnalysisDetail();
-  }, [analysisId]);
+  }, [fetchAnalysisDetail]);
 
   // 从图表数据中提取实际的日期范围
   const chartDateRange = useMemo(() => {
@@ -132,22 +226,9 @@ const AnalysisDetailPage: React.FC<AnalysisDetailPageProps> = ({ analysisIdOverr
       data.forEach((pt: any) => {
         const v = pt?.[xKey] ?? pt?.x ?? pt?.date;
         if (!v) return;
-        
-        // 转换为日期字符串 YYYY-MM-DD
-        let dateStr = '';
-        if (typeof v === 'string') {
-          dateStr = v.length >= 10 ? v.slice(0, 10) : v;
-        } else if (typeof v === 'number') {
-          // 可能是时间戳
-          const date = new Date(v);
-          if (!isNaN(date.getTime())) {
-            dateStr = date.toISOString().slice(0, 10);
-          }
-        }
-        
-        if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-          allDates.push(dateStr);
-        }
+
+        const dateStr = toLocalYmdFromUnknown(v);
+        if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) allDates.push(dateStr);
       });
     }
     
@@ -206,8 +287,9 @@ const AnalysisDetailPage: React.FC<AnalysisDetailPageProps> = ({ analysisIdOverr
       const filtered = data.filter((pt: any) => {
         const v = pt?.[xKey] ?? pt?.x ?? pt?.date;
         if (!v) return false;
-        const s = typeof v === 'string' ? (v.length >= 10 ? v.slice(0, 10) : v) : new Date(v).toISOString().slice(0, 10);
-        return s >= fromStr && s <= toStr;
+        const ymd = toLocalYmdFromUnknown(v);
+        if (!ymd) return false;
+        return ymd >= fromStr && ymd <= toStr;
       });
       sum += filtered.length;
     }
@@ -222,10 +304,7 @@ const AnalysisDetailPage: React.FC<AnalysisDetailPageProps> = ({ analysisIdOverr
       <DynamicAnalysisResult 
         analysisResult={analysis}
         filterDateRange={appliedRange}
-        onAIClick={() => {
-          // 可以在这里添加AI分析相关的逻辑
-          console.log('AI分析点击');
-        }}
+        onAIClick={() => {}}
       />
     );
   };
@@ -267,20 +346,6 @@ const AnalysisDetailPage: React.FC<AnalysisDetailPageProps> = ({ analysisIdOverr
     );
   }
 
-  const analysisModeLabel = analysis.mode === 'ai' ? 'AI 分析' : '自定义分析';
-  const formattedAnalysisName = (() => {
-    const base = notebookName?.trim();
-    if (base && base.length > 0) {
-      const sanitized = base.replace(/(分析|分析结果|笔记本?|笔记)$/g, '') || base;
-      return `${sanitized}分析`;
-    }
-    if (analysis.notebookType === 'mood') return '心情分析';
-    if (analysis.notebookType === 'study') return '学习分析';
-    if (analysis.notebookType === 'life') return '生活分析';
-    if (analysis.notebookType === 'work') return '工作分析';
-    return analysisModeLabel;
-  })();
-  
   const createdAt = analysis.metadata?.createdAt || (analysis as any).createdAt || '';
   const formattedCreatedAt = createdAt ? formatDate(createdAt) : '—';
 
@@ -288,6 +353,11 @@ const AnalysisDetailPage: React.FC<AnalysisDetailPageProps> = ({ analysisIdOverr
     <div className="min-h-screen bg-transparent">
       {/* 分析详情头部 */}
       <div className="max-w-6xl mx-auto px-4 pt-0 pb-6 space-y-4">
+        {notice && (
+          <div className="rounded-xl border border-[#d4f3ed] bg-white/80 px-4 py-2 text-sm text-[#0a917a] shadow-sm">
+            {notice}
+          </div>
+        )}
         <div className="flex flex-col gap-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2">
@@ -319,7 +389,6 @@ const AnalysisDetailPage: React.FC<AnalysisDetailPageProps> = ({ analysisIdOverr
               <button
                 onClick={() => {
                   // 导出功能
-                  console.log('导出分析结果');
                 }}
                 className="px-4 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
               >
@@ -327,16 +396,11 @@ const AnalysisDetailPage: React.FC<AnalysisDetailPageProps> = ({ analysisIdOverr
               </button>
               
               <button
-                onClick={() => {
-                  // 分享功能
-                  const url = `${window.location.origin}/analysis/${analysis.id}`;
-                  if (navigator.clipboard && navigator.clipboard.writeText) {
-                    navigator.clipboard.writeText(url)
-                      .then(() => alert('分析链接已复制到剪贴板'))
-                      .catch(() => alert('复制失败，请手动复制地址栏链接'));
-                  } else {
-                    prompt('复制分析页面链接', url);
-                  }
+                onClick={async () => {
+                  const url = getFullAnalysisUrl(analysis.id);
+                  const ok = await copyTextToClipboard(url);
+                  if (ok) showNotice('分析链接已复制');
+                  else prompt('复制分析页面链接', url);
                 }}
                 className="px-4 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
               >

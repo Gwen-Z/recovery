@@ -53,9 +53,12 @@ export const callCozeWorkflow = async ({
   };
   if (appId) apiPayload.app_id = appId;
 
-    const agent = new https.Agent({
+  const agent = new https.Agent({
     keepAlive: false,
-    secureProtocol: 'TLSv1_2_method',
+    family: 4,
+    // 显式指定 SNI，避免部分网络/代理环境下握手不带 server_name 导致服务端 reset
+    servername: 'api.coze.cn',
+    minVersion: 'TLSv1.2',
     ciphers: [
       'ECDHE-ECDSA-AES128-GCM-SHA256',
       'ECDHE-RSA-AES128-GCM-SHA256',
@@ -84,6 +87,7 @@ export const callCozeWorkflow = async ({
         },
         responseType: 'json',
         timeout: timeoutMs,
+        proxy: false,
         validateStatus: (status) => status < 500,
         httpsAgent: agent
       });
@@ -141,4 +145,3 @@ export const callCozeWorkflow = async ({
 
   throw lastError || new Error('调用 Coze Workflow 失败');
 };
-

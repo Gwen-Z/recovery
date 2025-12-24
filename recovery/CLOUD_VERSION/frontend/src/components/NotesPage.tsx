@@ -1,10 +1,9 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import apiClient, { Notebook } from '../apiClient';
-import NewNoteModal from './NewNoteModal';
 import MoveNoteModal from './MoveNoteModal';
+import CustomNotebookModal from './CustomNotebookModal';
 import { onConfigUpdate } from '../utils/componentSync';
-import { getDisplayTitle } from '../utils/displayTitle';
 
 // Define types for our data
 interface Note {
@@ -40,6 +39,17 @@ type ParsedComponentData = Record<
 >;
 
 const MAX_CARD_TITLE_LENGTH = 20;
+
+const getErrorMessage = (err: unknown, fallback: string) => {
+  if (!err) return fallback;
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === 'object' && err && 'message' in err) {
+    const msg = (err as any).message;
+    if (typeof msg === 'string' && msg.trim()) return msg;
+  }
+  if (typeof err === 'string' && err.trim()) return err;
+  return fallback;
+};
 
 const normalizeComponentValue = (value: unknown): string => {
   if (value === null || value === undefined) return '';
@@ -135,8 +145,8 @@ const normalizeComponentData = (raw: unknown): ParsedComponentData => {
 
 const stripEmbeddedJson = (text: string): string => {
   if (!text) return '';
-  let cleaned = text.replace(/```json[\s\S]*?```/gi, '');
-  cleaned = cleaned.replace(/\{[\s\S]*?\}/g, '').replace(/\[[\s\S]*?\]/g, '');
+  // 仅移除 fenced JSON code blocks，避免误删正文里的 { } / [ ]
+  const cleaned = text.replace(/```json[\s\S]*?```/gi, '');
   return cleaned.trim();
 };
 
@@ -273,7 +283,8 @@ const NoteItem = ({
   highlightNoteId,
   batchMode, 
   isSelected, 
-  onSelect 
+  onSelect,
+  onNotify
 }: { 
   note: Note; 
   displayTitle: string;
@@ -284,6 +295,7 @@ const NoteItem = ({
   batchMode: boolean;
   isSelected: boolean;
   onSelect: (noteId: string) => void;
+  onNotify?: (message: string) => void;
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -301,7 +313,7 @@ const NoteItem = ({
       setMoveOpen(false);
     } catch (error) {
       console.error('移动失败:', error);
-      alert('移动失败，请重试');
+      if (onNotify) onNotify('移动失败，请重试');
     }
   };
 
@@ -325,10 +337,6 @@ const NoteItem = ({
     };
   }, [menuOpen]);
 
-  const handleCardClick = (e: React.MouseEvent) => {
-    console.log('🖱️ 笔记卡片被点击，但不会跳转');
-  };
-
   const currentNoteId = String(note.id || note.note_id || '');
   const isHighlighted = !!highlightNoteId && currentNoteId && highlightNoteId === currentNoteId;
 
@@ -338,7 +346,6 @@ const NoteItem = ({
       className={`bg-white p-3 rounded-xl border border-gray-200 flex items-center justify-between hover:shadow-sm transition-shadow duration-200 cursor-default ${
         isSelected ? 'ring-2 ring-[#43ccb0] bg-[#eef6fd]' : ''
       } ${isHighlighted ? 'ring-2 ring-[#b5ece0] border-[#90e2d0] bg-white/90' : ''}`}
-      onClick={handleCardClick}
     >
       <div className="flex items-center gap-3">
         {batchMode && (
@@ -376,7 +383,7 @@ const NoteItem = ({
                     window.dispatchEvent(new Event('notes:refresh'));
                   } catch (error) {
                     console.error('重命名失败:', error);
-                    alert('重命名失败，请重试');
+                    if (onNotify) onNotify('重命名失败，请重试');
                   }
                 }} 
                 className="text-xs px-2 py-1 rounded-lg bg-[#06c3a8] text-white hover:bg-[#04b094] shadow-lg shadow-[#8de2d5] transition-colors"
@@ -433,7 +440,7 @@ const NoteItem = ({
                 if (note.source_url) {
                   window.open(note.source_url, '_blank');
                 } else {
-                  alert('无来源链接');
+                  if (onNotify) onNotify('无来源链接');
                 }
                 setMenuOpen(false);
               }} 
@@ -473,7 +480,7 @@ const NoteItem = ({
                     window.dispatchEvent(new Event('notes:refresh'));
                   } catch (error) {
                     console.error('删除失败:', error);
-                    alert('删除失败，请重试');
+                    if (onNotify) onNotify('删除失败，请重试');
                   }
                 }
                 setMenuOpen(false);
@@ -514,16 +521,22 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
   const [currentNotebookId, setCurrentNotebookId] = useState<string>(notebookId);
   const notesCacheRef = useRef<Map<string, { notes: Note[]; notebook: Notebook | null; fetchedAt: number }>>(new Map());
   const lastFetchRef = useRef<Map<string, number>>(new Map());
+  const notesRequestIdRef = useRef(0);
+  const notebooksRequestIdRef = useRef(0);
   
   const [loading, setLoading] = useState(true);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false); // 首次加载后不再整页loading
   const [error, setError] = useState<string | null>(null);
-  const [modalOpen, setModalOpen] = useState(false);
-  const [modalMode, setModalMode] = useState<'create' | 'edit'>('create');
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
   
   // 批量操作状态
   const [batchMode, setBatchMode] = useState(false);
   const [selectedNotes, setSelectedNotes] = useState<string[]>([]);
+  const [creatingNote, setCreatingNote] = useState(false);
+  const [createMenuOpen, setCreateMenuOpen] = useState(false);
+  const [customNotebookModalOpen, setCustomNotebookModalOpen] = useState(false);
+  const createMenuRootRef = useRef<HTMLDivElement | null>(null);
 
   const highlightNoteId = useRef<string | null>(null);
   const [activeHighlightNoteId, setActiveHighlightNoteId] = useState<string | null>(null);
@@ -579,8 +592,49 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
+      if (noticeTimerRef.current) {
+        window.clearTimeout(noticeTimerRef.current);
+        noticeTimerRef.current = null;
+      }
     };
   }, []);
+
+  const showNotice = useCallback((message: string) => {
+    setNotice(message);
+    if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => {
+      setNotice(null);
+      noticeTimerRef.current = null;
+    }, 1600);
+  }, []);
+
+  const isFilterActive = useMemo(
+    () => Boolean(searchQuery.trim() || dateFilter.startDate || dateFilter.endDate),
+    [searchQuery, dateFilter.startDate, dateFilter.endDate]
+  );
+
+  const selectableNoteIds = useMemo(() => {
+    const source = isFilterActive ? filteredNotes : notes;
+    return source.map((note) => String(note.id || note.note_id || '')).filter(Boolean);
+  }, [filteredNotes, isFilterActive, notes]);
+
+  const allSelectedInScope = useMemo(() => {
+    if (!selectableNoteIds.length) return false;
+    return selectableNoteIds.every((id) => selectedNotes.includes(id));
+  }, [selectableNoteIds, selectedNotes]);
+
+  // 点击外部区域关闭“新建”下拉菜单
+  useEffect(() => {
+    if (!createMenuOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target) return;
+      if (createMenuRootRef.current && createMenuRootRef.current.contains(target)) return;
+      setCreateMenuOpen(false);
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => document.removeEventListener('mousedown', handlePointerDown);
+  }, [createMenuOpen]);
 
   // 搜索和筛选功能
   useEffect(() => {
@@ -608,9 +662,10 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
     // 日期筛选
     if (dateFilter.startDate || dateFilter.endDate) {
       filtered = filtered.filter(note => {
-        const noteDate = new Date(note.created_at);
-        const startDate = dateFilter.startDate ? new Date(dateFilter.startDate) : null;
-        const endDate = dateFilter.endDate ? new Date(dateFilter.endDate) : null;
+        const noteDate = new Date(note.created_at || note.updated_at || '');
+        if (Number.isNaN(noteDate.getTime())) return false;
+        const startDate = dateFilter.startDate ? new Date(`${dateFilter.startDate}T00:00:00`) : null;
+        const endDate = dateFilter.endDate ? new Date(`${dateFilter.endDate}T23:59:59.999`) : null;
         
         if (startDate && endDate) {
           return noteDate >= startDate && noteDate <= endDate;
@@ -679,9 +734,10 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
   }, []);
 
   const loadNotebooks = useCallback(async () => {
+    const requestId = (notebooksRequestIdRef.current += 1);
     try {
       const notebooksList = await apiClient.getNotebooks();
-      if (isMountedRef.current) {
+      if (isMountedRef.current && requestId === notebooksRequestIdRef.current) {
         setNotebooks(notebooksList);
       }
     } catch (err) {
@@ -691,6 +747,8 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
 
   const fetchNotes = useCallback(
     async ({ forceNetwork = false }: { forceNetwork?: boolean } = {}) => {
+      const requestId = (notesRequestIdRef.current += 1);
+      const requestNotebookId = notebookId;
       if (!notebookId) {
         if (isMountedRef.current) {
           setLoading(false);
@@ -726,6 +784,8 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
         const response = await apiClient.get('/api/notes', {
           params: { notebook_id: notebookId }
         });
+        if (!isMountedRef.current || requestId !== notesRequestIdRef.current) return;
+        if (requestNotebookId !== notebookId) return;
         
         const data = response.data;
 
@@ -733,8 +793,10 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
           const message = data?.message || `加载笔记失败 (HTTP ${response.status})`;
           if (isMountedRef.current) {
             setError(message);
-            setNotebook(null);
-            setNotes([]);
+            if (!cached) {
+              setNotebook(null);
+              setNotes([]);
+            }
             setLoading(false);
           }
           return;
@@ -750,7 +812,7 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
         const notesPayload = normalizeNotes(rawNotes);
         const notebookPayload = data?.notebook || data?.data?.notebook || null;
 
-        if (isMountedRef.current) {
+        if (isMountedRef.current && requestId === notesRequestIdRef.current) {
           setNotebook(notebookPayload);
           setNotes(notesPayload);
           setLoading(false);
@@ -762,24 +824,24 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
           });
           lastFetchRef.current.set(notebookId, Date.now());
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error('❌ Error fetching notes:', err);
-        if (isMountedRef.current) {
-          const message = err?.message ? `加载笔记失败：${err.message}` : '加载笔记失败，请稍后再试';
-          setError(message);
-          if (!cached) {
-            setNotebook(null);
-            setNotes([]);
-          }
-          setLoading(false);
+        if (!isMountedRef.current || requestId !== notesRequestIdRef.current) return;
+        const message = `加载笔记失败：${getErrorMessage(err, '请稍后再试')}`;
+        setError(message);
+        if (!cached) {
+          setNotebook(null);
+          setNotes([]);
+        } else {
+          showNotice(message);
         }
       } finally {
-        if (isMountedRef.current) {
+        if (isMountedRef.current && requestId === notesRequestIdRef.current) {
           setLoading(false);
         }
       }
     },
-    [notebookId, normalizeNotes, hasLoadedOnce]
+    [notebookId, normalizeNotes, hasLoadedOnce, showNotice]
   );
 
   useEffect(() => {
@@ -804,6 +866,15 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
     window.addEventListener('notes:refresh', refresh as EventListener);
     return () => window.removeEventListener('notes:refresh', refresh as EventListener);
   }, [notebookId, fetchNotes, loadNotebooks]);
+
+  // 监听新建笔记本事件，刷新笔记本列表
+  useEffect(() => {
+    const handleNotebookCreated = () => {
+      loadNotebooks();
+    };
+    window.addEventListener('notebook:created', handleNotebookCreated as EventListener);
+    return () => window.removeEventListener('notebook:created', handleNotebookCreated as EventListener);
+  }, [loadNotebooks]);
 
   // 监听笔记本配置更新事件
   useEffect(() => {
@@ -850,11 +921,16 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
   };
 
   const handleSelectAll = () => {
-    if (selectedNotes.length === notes.length) {
-      setSelectedNotes([]);
-    } else {
-      setSelectedNotes(notes.map(note => note.id || note.note_id || ''));
+    if (!selectableNoteIds.length) return;
+    if (allSelectedInScope) {
+      setSelectedNotes((prev) => prev.filter((id) => !selectableNoteIds.includes(id)));
+      return;
     }
+    setSelectedNotes((prev) => {
+      const next = new Set(prev);
+      selectableNoteIds.forEach((id) => next.add(id));
+      return Array.from(next);
+    });
   };
 
   const handleBatchDelete = async () => {
@@ -868,7 +944,7 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
       refreshNotes();
     } catch (error) {
       console.error('批量删除失败:', error);
-      alert('批量删除失败，请重试');
+      showNotice('批量删除失败，请重试');
     }
   };
 
@@ -884,7 +960,7 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
       refreshNotes();
     } catch (error) {
       console.error('批量移动失败:', error);
-      alert('批量移动失败，请重试');
+      showNotice('批量移动失败，请重试');
     }
   };
 
@@ -892,7 +968,8 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
     return <div className="flex items-center justify-center h-full text-gray-500">Loading notes...</div>;
   }
 
-  if (error) {
+  const fatalError = Boolean(error) && notes.length === 0 && !hasLoadedOnce;
+  if (fatalError) {
     return <div className="flex items-center justify-center h-full text-red-500">{error}</div>;
   }
 
@@ -901,7 +978,17 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
   }
 
   return (
-    <div className="pl-2 pr-6 pt-0 pb-12 h-full overflow-y-auto no-scrollbar">
+    <div className="pl-2 pr-6 pt-0 pb-12">
+      {notice && (
+        <div className="mb-4 rounded-xl border border-[#d4f3ed] bg-white/80 px-4 py-2 text-sm text-[#0a917a] shadow-sm">
+          {notice}
+        </div>
+      )}
+      {error && (
+        <div className="mb-4 rounded-xl border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">
+          {error}
+        </div>
+      )}
       {/* Header Section */}
       <div className="mb-6">
         <div className="grid grid-cols-[260px_1fr] gap-4 items-stretch">
@@ -941,7 +1028,8 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
                 <button
                   type="button"
                   onClick={() => {
-                    console.log('🔍 执行日期筛选查询:', dateFilter);
+                    refreshNotes();
+                    showNotice('已刷新');
                   }}
                   className="px-3 py-2 text-xs font-medium text-white bg-[#06c3a8] rounded-lg hover:bg-[#04b094] shadow-lg shadow-[#8de2d5]"
                 >
@@ -1026,21 +1114,131 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
                 )}
                 {!batchMode && (
                   <>
-                    <button onClick={() => {
-                      const isFitnessNotebook = notebook?.name?.toLowerCase().includes('健身') || 
-                                              notebook?.name?.toLowerCase().includes('fitness');
-                      
-                      if (isFitnessNotebook) {
-                        setModalMode('edit');
-                      } else {
-                        setModalMode('create');
-                      }
-                      
-                      setModalOpen(true);
-                    }} className="px-3 py-2 text-xs font-medium text-gray-700 bg-white border border-gray-300 rounded-2xl hover:bg-[#eef6fd] hover:border-[#b5ece0] flex items-center gap-2 whitespace-nowrap">
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>
-                      新建笔记
-                    </button>
+                    <div
+                      ref={createMenuRootRef}
+                      className="relative inline-flex rounded-2xl border border-gray-300 bg-white"
+                    >
+                      <button
+                        type="button"
+                        disabled={creatingNote}
+                        onClick={async () => {
+                          try {
+                            if (creatingNote) return;
+                            if (!notebookId) {
+                              showNotice('未选择笔记本');
+                              return;
+                            }
+
+                            setCreatingNote(true);
+                            const response = await apiClient.post('/api/notes', {
+                              notebook_id: notebookId,
+                              title: '未命名笔记',
+                              content_text: '',
+                              component_data: {
+                                note_meta: {
+                                  type: 'meta',
+                                  title: 'note_meta',
+                                  value: { sourceType: 'manual', contentHtml: '<p></p>', imgUrls: [] }
+                                }
+                              },
+                              source_type: 'manual',
+                              skipAI: true
+                            });
+
+                            const created = response?.data?.note;
+                            const createdId = created?.note_id || created?.noteId;
+                            if (!createdId) {
+                              throw new Error(response?.data?.error || response?.data?.message || '创建失败');
+                            }
+
+                            navigate(`/note/${createdId}`, { state: { note: created, notebook } });
+                          } catch (err: any) {
+                            showNotice(
+                              err?.response?.data?.error ||
+                                err?.response?.data?.message ||
+                                err?.message ||
+                                '创建笔记失败'
+                            );
+                          } finally {
+                            setCreatingNote(false);
+                          }
+                        }}
+                        className="rounded-l-2xl px-3 py-2 text-xs font-medium text-gray-700 hover:bg-[#eef6fd] disabled:cursor-not-allowed disabled:opacity-60 flex items-center gap-2 whitespace-nowrap"
+                      >
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          className="h-4 w-4"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth={2}
+                            d="M12 6v6m0 0v6m0-6h6m-6 0H6"
+                          />
+                        </svg>
+                        {creatingNote ? '创建中…' : '新建笔记'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={creatingNote}
+                        onClick={() => setCreateMenuOpen((v) => !v)}
+                        className="rounded-r-2xl px-2 py-2 text-gray-600 hover:bg-[#eef6fd] disabled:cursor-not-allowed disabled:opacity-60 border-l border-gray-300"
+                        aria-haspopup="menu"
+                        aria-expanded={createMenuOpen}
+                        title="更多创建选项"
+                      >
+                        <svg
+                          className={`h-4 w-4 transition-transform ${createMenuOpen ? 'rotate-180' : ''}`}
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          xmlns="http://www.w3.org/2000/svg"
+                        >
+                          <path
+                            d="M6 9l6 6 6-6"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                        </svg>
+                      </button>
+
+                      {createMenuOpen && (
+                        <div className="absolute right-0 top-full z-[999] mt-2 w-44 rounded-xl border border-gray-200 bg-white p-1 shadow-lg">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setCreateMenuOpen(false);
+                              setCustomNotebookModalOpen(true);
+                            }}
+                            className="w-full rounded-lg px-3 py-2 text-left text-xs font-medium text-gray-700 hover:bg-[#eef6fd] flex items-center gap-2"
+                          >
+                            <svg
+                              className="h-4 w-4 text-[#0a917a]"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              xmlns="http://www.w3.org/2000/svg"
+                            >
+                              <path
+                                d="M4 7.5A2.5 2.5 0 0 1 6.5 5h11A2.5 2.5 0 0 1 20 7.5v9A2.5 2.5 0 0 1 17.5 19h-11A2.5 2.5 0 0 1 4 16.5v-9Z"
+                                stroke="currentColor"
+                                strokeWidth="1.6"
+                              />
+                              <path
+                                d="M8 9h8M8 12h8M8 15h5"
+                                stroke="currentColor"
+                                strokeWidth="1.6"
+                                strokeLinecap="round"
+                              />
+                            </svg>
+                            新建笔记本
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </>
                 )}
             </div>
@@ -1061,6 +1259,7 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
             batchMode={batchMode}
             isSelected={selectedNotes.includes(note.id || note.note_id || '')}
             onSelect={handleNoteSelect}
+            onNotify={showNotice}
             onNoteClick={() => {
               const noteId = note.id || note.note_id;
               if (!noteId) return;
@@ -1079,13 +1278,6 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
             </div>
         )}
       </div>
-      <NewNoteModal 
-        isOpen={modalOpen} 
-        onClose={() => setModalOpen(false)} 
-        notebookId={notebookId} 
-        onCreated={refreshNotes}
-        mode={modalMode}
-      />
       
       {/* 批量删除确认对话框 */}
       {batchDeleteConfirmOpen && (
@@ -1162,6 +1354,12 @@ const NotesPage = ({ notebookId }: { notebookId: string }) => {
           </div>
         </div>
       )}
+
+      <CustomNotebookModal
+        open={customNotebookModalOpen}
+        onClose={() => setCustomNotebookModalOpen(false)}
+        onCreated={loadNotebooks}
+      />
 
     </div>
   );

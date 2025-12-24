@@ -7,11 +7,15 @@ import NotesPage from './components/NotesPage'
 import LandingPage from './landing/LandingPage'
 import NoteDetailPage from './components/NoteDetailPage'
 import AnalysisDetailPage from './components/AnalysisDetailPage'
-import AnalysisSettingV2Page from './components/AnalysisSettingV2Page'
-import TypeNotesPage from './components/TypeNotesPage'
+import AnalysisV2OnDemandPage from './components/AnalysisV2OnDemandPage'
 import NotebookAssistantPage from './components/NotebookAssistantPage'
 import useCodeCopyButtons from './hooks/useCodeCopyButtons'
 import TopNavigation from './components/TopNavigation'
+import { AuthProvider } from './auth/AuthContext'
+import AuthModal from './components/AuthModal'
+import AuthCallbackPage from './auth/pages/AuthCallbackPage'
+import VerifyEmailPage from './auth/pages/VerifyEmailPage'
+import ResetPasswordPage from './auth/pages/ResetPasswordPage'
 
 type ViewType =
   | 'notes'
@@ -24,29 +28,35 @@ type ViewType =
 function App() {
   useCodeCopyButtons()
   return (
-    <div className="min-h-screen bg-[#eef6fd]">
-      <Routes>
-        <Route path="/" element={<LandingPage />} />
-        <Route path="/typenotes" element={<TypeNotesPage />} />
-        <Route path="/app" element={<AppContent />} />
-        <Route path="/workspace" element={<AppContent />} />
-        <Route path="/analysis" element={<AppContent />} />
-        <Route path="/analysis/" element={<AppContent />} />
-        {/* 新版分析 V2 入口 */}
-        <Route path="/analysis/v2" element={<AppContent />} />
-        <Route path="/analysis/v2/:notebookId" element={<AppContent />} />
-        {/* 兼容旧的双斜杠路径 */}
-        <Route path="/analysis//" element={<AppContent />} />
-        <Route path="/analysis//:notebookId" element={<AppContent />} />
-        <Route path="/analysis/settingV2/:noteid" element={<AppContent />} />
-        <Route path="/notes" element={<AppContent />} />
-        <Route path="/notes/:notebookId" element={<AppContent />} />
-        <Route path="/notes/:notebookId/assistant" element={<AppContent />} />
-        <Route path="/ai_assistant" element={<AppContent />} />
-        <Route path="/note/:noteId" element={<NoteDetailPage />} />
-        <Route path="/analysis/:analysisId" element={<AppContent />} />
-      </Routes>
-    </div>
+    <AuthProvider>
+      <div className="min-h-screen bg-[#eef6fd]">
+        <Routes>
+          <Route path="/" element={<LandingPage />} />
+          <Route path="/auth/callback" element={<AuthCallbackPage />} />
+          <Route path="/auth/verify-email" element={<VerifyEmailPage />} />
+          <Route path="/auth/reset-password" element={<ResetPasswordPage />} />
+          <Route path="/app" element={<AppContent />} />
+          <Route path="/workspace" element={<AppContent />} />
+          <Route path="/workplace" element={<AppContent />} />
+          <Route path="/analysis" element={<AppContent />} />
+          <Route path="/analysis/" element={<AppContent />} />
+          {/* 新版分析 V2 入口 */}
+          <Route path="/analysis/v2" element={<AppContent />} />
+          <Route path="/analysis/v2/:notebookId" element={<AppContent />} />
+          {/* 兼容旧的双斜杠路径 */}
+          <Route path="/analysis//" element={<AppContent />} />
+          <Route path="/analysis//:notebookId" element={<AppContent />} />
+          <Route path="/analysis/settingV2/:noteid" element={<AppContent />} />
+          <Route path="/notes" element={<AppContent />} />
+          <Route path="/notes/:notebookId" element={<AppContent />} />
+          <Route path="/notes/:notebookId/assistant" element={<AppContent />} />
+          <Route path="/ai_assistant" element={<AppContent />} />
+          <Route path="/note/:noteId" element={<NoteDetailPage />} />
+          <Route path="/analysis/:analysisId" element={<AppContent />} />
+        </Routes>
+        <AuthModal />
+      </div>
+    </AuthProvider>
   )
 }
 
@@ -63,6 +73,22 @@ function AppContent() {
   const [analysisDetailId, setAnalysisDetailId] = useState<string | null>(null)
   const [navMenuOpenId, setNavMenuOpenId] = useState<string | null>(null)
   const navMenuCloseTimer = useRef<number | null>(null)
+
+  useEffect(() => {
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousHtmlOverflow = document.documentElement.style.overflow;
+    const previousOverscroll = document.body.style.overscrollBehavior;
+
+    document.documentElement.style.overflow = 'hidden';
+    document.body.style.overflow = 'hidden';
+    document.body.style.overscrollBehavior = 'none';
+
+    return () => {
+      document.body.style.overflow = previousBodyOverflow;
+      document.documentElement.style.overflow = previousHtmlOverflow;
+      document.body.style.overscrollBehavior = previousOverscroll;
+    };
+  }, []);
 
   const resolveNotebookId = useCallback(() => {
     return activeNotebookId || notebooks[0]?.notebook_id || null
@@ -136,22 +162,8 @@ function AppContent() {
     try {
       setLoading(true)
       setError(null)
-      
-      // 增加超时时间到10秒，并添加 AbortController 支持
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 10000)
-      
-      try {
-        const notebookList = await apiClient.getNotebooks()
-        clearTimeout(timeoutId)
-        setNotebooks(notebookList)
-      } catch (fetchError: any) {
-        clearTimeout(timeoutId)
-        if (controller.signal.aborted) {
-          throw new Error('请求超时，请检查网络连接或后端服务')
-        }
-        throw fetchError
-      }
+      const notebookList = await apiClient.getNotebooks()
+      setNotebooks(notebookList)
     } catch (err: any) {
       console.error('加载笔记本列表失败:', err)
       // 静默失败，使用空列表，允许页面继续显示
@@ -319,14 +331,16 @@ function AppContent() {
 
   return (
     <div className="flex h-screen flex-col bg-[#eef6fd] text-slate-800 overflow-hidden">
-      <TopNavigation />
-      <div className="grid flex-1 grid-cols-[280px_1fr] gap-4 px-4 py-0 min-h-0">
-        <aside className="h-full bg-transparent p-4 overflow-y-auto overflow-x-hidden no-scrollbar" style={{ width: '280px', minWidth: '280px' }}>
-        <button
-          onClick={() => {
-            setView('workspace')
-            navigate('/workspace')
-            setAnalysisDetailId(null)
+	      <TopNavigation />
+	      <div className="grid flex-1 grid-cols-[280px_1fr] gap-4 px-4 py-0 min-h-0">
+	        <aside className="h-full bg-transparent p-4 overflow-hidden" style={{ width: '280px', minWidth: '280px' }}>
+            <div className="flex h-full flex-col">
+              <div className="flex-1 overflow-y-auto overflow-x-hidden show-scrollbar">
+	        <button
+	          onClick={() => {
+	            setView('workspace')
+	            navigate('/workspace')
+	            setAnalysisDetailId(null)
           }}
           className={`w-full flex items-center justify-between rounded-2xl px-3 py-2 transition-colors ${
             view === 'workspace'
@@ -553,16 +567,24 @@ function AppContent() {
                 ))
               ) : (
                 <div className="text-gray-500 px-3 py-2" style={{ fontSize: '14px', lineHeight: '1.5', letterSpacing: '0.2px' }}>暂无笔记本</div>
-              )}
-            </nav>
-          )}
-        </aside>
+	              )}
+	            </nav>
+	          )}
+              </div>
+            </div>
+	        </aside>
 
-        <section className="h-full px-2 pt-4 min-w-0 overflow-y-auto no-scrollbar">
-          {view === 'workspace' && <CreateWorkspacePage />}
+        <section
+          className={`h-full px-2 pt-4 min-w-0 min-h-0 ${
+            view === 'notes-assistant' ? 'overflow-hidden' : 'overflow-y-auto show-scrollbar'
+          }`}
+        >
+          {view === 'workspace' && (
+            <CreateWorkspacePage notebooks={notebooks} onRequestNotebookRefresh={loadNotebooks} />
+          )}
           {view === 'analysis-list' && <AnalysisListPage />}
           {view === 'analysis-setting-v2' && (
-            <AnalysisSettingV2Page notebookIdOverride={activeNotebookId} />
+            <AnalysisV2OnDemandPage notebookIdOverride={activeNotebookId} />
           )}
           {view === 'analysis-detail' && analysisDetailId && (
             <>
@@ -583,7 +605,12 @@ function AppContent() {
             <NotesPage notebookId={activeNotebookId} />
           )}
           {view === 'notes-assistant' && resolveNotebookId() && (
-            <NotebookAssistantPage notebookId={resolveNotebookId() as string} />
+            <NotebookAssistantPage
+              notebookId={resolveNotebookId() as string}
+              notebooks={notebooks}
+              notebooksLoading={loading}
+              onRequestNotebookRefresh={loadNotebooks}
+            />
           )}
           {view === 'notes' && !activeNotebookId && (
             <div className="flex items-center justify-center h-full text-gray-500">

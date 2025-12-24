@@ -6,13 +6,17 @@ import React, {
   useEffect,
   useCallback
 } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { ArticleIcon, BookExcerptIcon, InspirationNoteIcon, MeetingNoteIcon, TodoIcon } from './WorkspaceSceneIcons';
+import { useAuth } from '../auth/AuthContext';
+import { setWorkspaceStartAction } from '../utils/workspaceStartAction';
 
 type InputMode = 'link' | 'text';
 
 type SceneBubble = {
   id: string;
   label: string;
-  emoji: string;
+  icon: React.ReactNode;
   mode: InputMode;
   placeholder?: string;
   anchor: { x: number; y: number };
@@ -23,7 +27,7 @@ const SCENE_BUBBLES: SceneBubble[] = [
   {
     id: 'meeting',
     label: '会议记录',
-    emoji: '🗓️',
+    icon: <MeetingNoteIcon className="h-4 w-4" />,
     mode: 'text',
     placeholder: '简单记录这次会议的要点、结论和待办…',
     anchor: { x: 0.22, y: 0.28 },
@@ -32,7 +36,7 @@ const SCENE_BUBBLES: SceneBubble[] = [
   {
     id: 'thinking',
     label: '思考卡片',
-    emoji: '🧠',
+    icon: <InspirationNoteIcon className="h-4 w-4" />,
     mode: 'text',
     placeholder: '写下一段想法或灵感，AI 会帮你整理成可复用的思考卡片…',
     anchor: { x: 0.6, y: 0.22 },
@@ -41,7 +45,7 @@ const SCENE_BUBBLES: SceneBubble[] = [
   {
     id: 'reading',
     label: '读书摘录',
-    emoji: '📚',
+    icon: <BookExcerptIcon className="h-4 w-4" />,
     mode: 'text',
     placeholder: '粘贴一段你正在阅读的内容，AI 会帮你提炼要点…',
     anchor: { x: 0.8, y: 0.32 },
@@ -50,7 +54,7 @@ const SCENE_BUBBLES: SceneBubble[] = [
   {
     id: 'weixin-article',
     label: '公众号长文',
-    emoji: '📰',
+    icon: <ArticleIcon className="h-4 w-4" />,
     mode: 'link',
     placeholder: '粘贴公众号/知乎等文章链接，交给 AI 帮你拆解…',
     anchor: { x: 0.24, y: 0.7 },
@@ -59,7 +63,7 @@ const SCENE_BUBBLES: SceneBubble[] = [
   {
     id: 'todo',
     label: '待办清单',
-    emoji: '✅',
+    icon: <TodoIcon className="h-4 w-4" />,
     mode: 'text',
     placeholder: '把杂乱的待办和想法丢进来，AI 会帮你整理成清单…',
     anchor: { x: 0.78, y: 0.72 },
@@ -105,6 +109,8 @@ function computeAvoidOffset(
 }
 
 const LandingHeroParseSection: React.FC = () => {
+  const navigate = useNavigate();
+  const { user, openAuthModal } = useAuth();
   const [mode, setMode] = useState<InputMode>('link');
   const [inputValue, setInputValue] = useState('');
   const [activeSceneId, setActiveSceneId] = useState<string | null>(null);
@@ -231,7 +237,21 @@ const LandingHeroParseSection: React.FC = () => {
   }, [modeMenuOpen]);
 
   const handleStartParse = () => {
-    // 首页暂不接入真实解析行为，这里只保留按钮交互
+    if (!user) {
+      openAuthModal('login');
+      return;
+    }
+
+    const trimmed = inputValue.trim();
+    if (!trimmed) return;
+
+    setWorkspaceStartAction({
+      source: 'landing',
+      mode,
+      inputValue: trimmed,
+      activeSceneId
+    });
+    navigate('/workspace');
   };
 
   const handleSaveDraft = () => {
@@ -306,7 +326,7 @@ const LandingHeroParseSection: React.FC = () => {
                     transform: `scale(${b.scale})`
                   }}
                 >
-                  <span>{b.emoji}</span>
+                  <span className="inline-flex h-4 w-4 items-center justify-center">{b.icon}</span>
                   <span className="whitespace-nowrap">{b.label}</span>
                 </button>
               </div>
@@ -323,9 +343,9 @@ const LandingHeroParseSection: React.FC = () => {
               <h1 className="text-[56px] font-semibold tracking-[1.5px] text-[#0a223d] md:text-[56px]">
                 开始回响之旅
               </h1>
-              <p className="mt-3 max-w-2xl mx-auto text-center text-[13px] leading-relaxed text-slate-500 md:text-[14px]">
-                &lt;支持链接解析、文本解析&gt;
-              </p>
+	              <p className="mt-3 max-w-2xl mx-auto text-center text-[13px] leading-relaxed text-slate-500 md:text-[14px]">
+	                &lt;支持链接解析、随手记&gt;
+	              </p>
             </div>
           </div>
         </div>
@@ -348,7 +368,7 @@ const LandingHeroParseSection: React.FC = () => {
                       <TextParseIcon className="h-4 w-4 text-slate-500" />
                     )}
                   </span>
-                  <span>{mode === 'link' ? '链接解析' : '文本解析'}</span>
+	                  <span>{mode === 'link' ? '链接解析' : '随手记'}</span>
                   <span className="ml-auto text-slate-400">
                     <svg className={`h-3 w-3 transition ${modeMenuOpen ? 'rotate-180' : ''}`} viewBox="0 0 24 24" fill="none">
                       <path
@@ -364,10 +384,10 @@ const LandingHeroParseSection: React.FC = () => {
                 {modeMenuOpen && (
                   <div className="absolute left-0 top-[calc(100%+6px)] w-[180px] rounded-2xl shadow-[0_18px_40px_rgba(15,23,42,0.12)]">
                     <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
-                      {[
-                        { value: 'link' as InputMode, label: '链接解析', Icon: LinkParseIcon },
-                        { value: 'text' as InputMode, label: '文本解析', Icon: TextParseIcon }
-                      ].map(({ value, label, Icon }) => {
+	                      {[
+	                        { value: 'link' as InputMode, label: '链接解析', Icon: LinkParseIcon },
+	                        { value: 'text' as InputMode, label: '随手记', Icon: TextParseIcon }
+	                      ].map(({ value, label, Icon }) => {
                         const active = mode === value;
                         return (
                           <button
@@ -423,10 +443,10 @@ const LandingHeroParseSection: React.FC = () => {
                       type="button"
                       onClick={handleStartParse}
                       className="inline-flex items-center justify-center gap-2 rounded-l-full bg-gradient-to-r from-[#06c3a8] to-[#43ccb0] px-5 py-2 text-sm font-semibold text-white shadow-[0_16px_32px_rgba(6,195,168,0.32)] hover:brightness-110 transition"
-                    >
-                      <span className="text-base">✨</span>
-                      <span>开始解析</span>
-                    </button>
+	                    >
+	                      <span className="text-base">✨</span>
+	                      <span>{mode === 'link' ? '开始解析' : 'AI分配'}</span>
+	                    </button>
                     <button
                       type="button"
                       onClick={() => setStartMenuOpen((v) => !v)}

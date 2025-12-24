@@ -2,6 +2,9 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import apiClient from '../apiClient'
 import ParseHistoryEditModal from './ParseHistoryEditModal'
+import { DEFAULT_AI_SUMMARY_PROMPT } from '../constants/aiSummary'
+import { PARSE_HISTORY_EVENTS } from '../constants/events'
+import { useAiSummaryPrompts } from '../hooks/useAiSummaryPrompts'
 import { HistoryStatus, normalizeHistoryStatus } from '../utils/parseHistoryStatus'
 
 type NotebookOption = {
@@ -13,11 +16,7 @@ type NotebookOption = {
   updated_at?: string | null
 }
 
-const PARSE_SETTINGS_STORAGE_KEY = 'ai_parse_settings_v1'
-const TEXT_PROMPT_STORAGE_KEY = 'ai_parse_text_prompt_v1'
 const IMPORT_HISTORY_OPEN_STORAGE_KEY = 'ai_import_history_open_v1'
-const DEFAULT_AI_SUMMARY_PROMPT =
-  '请将内容整理为不超过5条的要点，突出文章核心信息，使用简洁的中文有序列表输出。'
 
 const SearchHistoryIcon = ({ className }: { className?: string }) => (
   <svg
@@ -34,10 +33,6 @@ const SearchHistoryIcon = ({ className }: { className?: string }) => (
   </svg>
 )
 
-type ParseSettings = {
-  aiSummaryPrompt: string
-}
-
 const loadInitialImportHistoryOpen = (): boolean => {
   if (typeof window === 'undefined') return true
   try {
@@ -48,34 +43,6 @@ const loadInitialImportHistoryOpen = (): boolean => {
     // ignore
   }
   return false
-}
-
-const loadInitialLinkPrompt = (): string => {
-  if (typeof window === 'undefined') return DEFAULT_AI_SUMMARY_PROMPT
-  try {
-    const stored = window.localStorage.getItem(PARSE_SETTINGS_STORAGE_KEY)
-    if (stored) {
-      const parsed = JSON.parse(stored)
-      const prompt =
-        typeof parsed?.aiSummaryPrompt === 'string' && parsed.aiSummaryPrompt.trim()
-          ? parsed.aiSummaryPrompt
-          : DEFAULT_AI_SUMMARY_PROMPT
-      return prompt
-    }
-  } catch {
-    // ignore
-  }
-  return DEFAULT_AI_SUMMARY_PROMPT
-}
-
-const loadInitialTextPrompt = (): string => {
-  if (typeof window === 'undefined') return DEFAULT_AI_SUMMARY_PROMPT
-  try {
-    const stored = window.localStorage.getItem(TEXT_PROMPT_STORAGE_KEY)
-    return stored && stored.trim() ? stored : DEFAULT_AI_SUMMARY_PROMPT
-  } catch {
-    return DEFAULT_AI_SUMMARY_PROMPT
-  }
 }
 
 const parseKeywords = (tags?: string | null) => {
@@ -493,38 +460,17 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
   const [error, setError] = useState<string | null>(null)
   const [successMessage, setSuccessMessage] = useState<string | null>(null)
 
-  const [linkPrompt, setLinkPrompt] = useState<string>(() => loadInitialLinkPrompt())
-  const [textPrompt, setTextPrompt] = useState<string>(() => loadInitialTextPrompt())
+  const { linkPrompt, textPrompt, setLinkPrompt, setTextPrompt } = useAiSummaryPrompts()
   const [historySearchInput, setHistorySearchInput] = useState('')
   const [historySearchQuery, setHistorySearchQuery] = useState('')
 
   const updateParseSettingsPrompt = useCallback((nextPrompt: string) => {
-    const trimmed = nextPrompt.trim() || DEFAULT_AI_SUMMARY_PROMPT
-    setLinkPrompt(trimmed)
-    if (typeof window === 'undefined') return
-    try {
-      const stored = window.localStorage.getItem(PARSE_SETTINGS_STORAGE_KEY)
-      const current = stored ? JSON.parse(stored) : {}
-      const next: ParseSettings = {
-        ...current,
-        aiSummaryPrompt: trimmed
-      }
-      window.localStorage.setItem(PARSE_SETTINGS_STORAGE_KEY, JSON.stringify(next))
-    } catch (err) {
-      console.warn('无法保存解析设置', err)
-    }
-  }, [])
+    setLinkPrompt(nextPrompt)
+  }, [setLinkPrompt])
 
   const updateTextPrompt = useCallback((nextPrompt: string) => {
-    const trimmed = nextPrompt.trim() || DEFAULT_AI_SUMMARY_PROMPT
-    setTextPrompt(trimmed)
-    if (typeof window === 'undefined') return
-    try {
-      window.localStorage.setItem(TEXT_PROMPT_STORAGE_KEY, trimmed)
-    } catch {
-      // ignore
-    }
-  }, [])
+    setTextPrompt(nextPrompt)
+  }, [setTextPrompt])
 
   const toggleImportHistoryOpen = useCallback(() => {
     setImportHistoryOpen(prev => {
@@ -549,10 +495,9 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
         // ignore
       }
     }
-    const panel = document.getElementById('ai-import-history-panel')
-    if (panel) {
-      panel.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    }
+    // 不自动 scrollIntoView：
+    // - 从首页“自动开始解析”跳转过来时，scrollIntoView 会把页面强制滚动到历史面板附近，
+    //   造成视觉上像“白色遮挡/跳动”，并且让用户错过顶部的输入区与状态。
   }, [])
 
   const availableNotebooks = useMemo(() => notebooks || [], [notebooks])
@@ -565,7 +510,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
     [availableNotebooks]
   )
 
-  // 加载解析历史（与 AINoteImportPage 保持一致）
+  // 加载解析/分配历史（与 AINoteImportPage 保持一致）
   const loadHistory = useCallback(async () => {
     setLoadingHistory(true)
     setHistoryLoadError(null)
@@ -581,7 +526,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
 
       const controller = new AbortController()
       timeoutId = setTimeout(() => {
-        console.warn('⏰ 解析历史请求超时，取消请求')
+        console.warn('⏰ 解析/分配历史请求超时，取消请求')
         controller.abort()
       }, 60000)
 
@@ -656,7 +601,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
   }
 
   const handleDeleteHistory = async (historyId: string) => {
-    if (!window.confirm('确定要删除这条解析历史吗？')) return
+    if (!window.confirm('确定要删除这条解析/分配历史吗？')) return
     try {
       await apiClient.delete(`/api/coze/parse-history/${historyId}`)
       const currentPageIndex = (currentPage - 1) * itemsPerPage
@@ -679,7 +624,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
 
   const handleBatchDeleteHistory = async () => {
     if (selectedHistoryIds.size === 0) return
-    if (!window.confirm(`确定要删除选中的 ${selectedHistoryIds.size} 条解析历史吗？`)) return
+    if (!window.confirm(`确定要删除选中的 ${selectedHistoryIds.size} 条解析/分配历史吗？`)) return
     try {
       const deletePromises = Array.from(selectedHistoryIds).map(id =>
         apiClient.delete(`/api/coze/parse-history/${id}`)
@@ -843,7 +788,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
     loadHistory()
   }, [loadHistory])
 
-  // 外部触发：刷新解析历史（例如工作台存草稿）
+  // 外部触发：刷新解析/分配历史（例如工作台存草稿）
   useEffect(() => {
     const handler = (event: Event) => {
       const custom = event as CustomEvent<{ historyId?: string | null }>
@@ -857,13 +802,13 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
         }, 3000)
       }
     }
-    window.addEventListener('parse-history:refresh', handler as EventListener)
-    window.addEventListener('parse-history:created', handler as EventListener)
-    window.addEventListener('parse-history:open', openImportHistory as unknown as EventListener)
+    window.addEventListener(PARSE_HISTORY_EVENTS.refresh, handler as EventListener)
+    window.addEventListener(PARSE_HISTORY_EVENTS.created, handler as EventListener)
+    window.addEventListener(PARSE_HISTORY_EVENTS.open, openImportHistory as unknown as EventListener)
     return () => {
-      window.removeEventListener('parse-history:refresh', handler as EventListener)
-      window.removeEventListener('parse-history:created', handler as EventListener)
-      window.removeEventListener('parse-history:open', openImportHistory as unknown as EventListener)
+      window.removeEventListener(PARSE_HISTORY_EVENTS.refresh, handler as EventListener)
+      window.removeEventListener(PARSE_HISTORY_EVENTS.created, handler as EventListener)
+      window.removeEventListener(PARSE_HISTORY_EVENTS.open, openImportHistory as unknown as EventListener)
     }
   }, [loadHistory, openImportHistory])
 
@@ -888,7 +833,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
       return <div className="text-center py-8 text-rose-600">{historyLoadError}</div>
     }
     if (historyList.length === 0) {
-      return <div className="text-center py-8 text-slate-400">暂无解析历史</div>
+      return <div className="text-center py-8 text-slate-400">暂无解析/分配历史</div>
     }
 
     const totalPages = Math.ceil(historyList.length / itemsPerPage)
@@ -963,7 +908,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
               : history.source_url && !history.source_url.startsWith('manual:')
                 ? 'from_url'
                 : 'manual_text'
-            const sourceLabel = normalizedSourceType === 'from_url' ? '链接解析' : '文本解析'
+            const sourceLabel = normalizedSourceType === 'from_url' ? '链接解析' : '随手记'
             const sourceColor =
               normalizedSourceType === 'from_url'
                 ? 'bg-[#d4f3ed] text-[#0a6154]'
@@ -1098,7 +1043,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
                         disabled={!canAiAssign || isAssigningCurrent}
                         title={
                           canAiAssign
-                            ? '根据解析内容自动匹配合适的笔记本'
+                            ? 'AI将分配到合适的归属笔记本'
                             : aiAssignDisabledReason || '暂不可用'
                         }
                       >
@@ -1248,7 +1193,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
             aria-expanded={importHistoryOpen}
             aria-controls="ai-import-history-panel"
           >
-            <h2 className="text-base font-semibold text-slate-800">解析历史</h2>
+            <h2 className="text-base font-semibold text-slate-800">解析/分配历史</h2>
             <span
               className={`inline-flex h-7 w-7 items-center justify-center rounded-lg bg-white/70 text-slate-500 border border-slate-200 transition-transform duration-200 ${
                 importHistoryOpen ? 'rotate-180' : ''
@@ -1267,7 +1212,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
             </span>
             {!importHistoryOpen && (
               <span className="text-[12px] text-slate-500">
-                {loadingHistory ? '加载中…' : historyList.length ? `共 ${historyList.length} 条` : '暂无解析历史'}
+                {loadingHistory ? '加载中…' : historyList.length ? `共 ${historyList.length} 条` : '暂无解析/分配历史'}
               </span>
             )}
           </button>
@@ -1285,7 +1230,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
                       handleHistorySearch()
                     }
                   }}
-                  placeholder="搜索解析历史..."
+                  placeholder="搜索解析/分配历史..."
                   className="flex-1 bg-transparent text-sm text-slate-700 placeholder:text-slate-400 focus:outline-none"
                 />
                 <button
@@ -1293,7 +1238,7 @@ export default function ParseHistoryPanel({ notebooks, onRequestNotebookRefresh 
                   onClick={handleHistorySearch}
                   disabled={loadingHistory}
                   className="ml-2 inline-flex h-7 w-7 items-center justify-center rounded-full bg-[#06c3a8] text-white shadow hover:brightness-110 disabled:opacity-60"
-                  title="搜索解析历史"
+                  title="搜索解析/分配历史"
                 >
                   <SearchHistoryIcon className="h-3.5 w-3.5" />
                 </button>

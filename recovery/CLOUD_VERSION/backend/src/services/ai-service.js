@@ -50,10 +50,13 @@ export default class AIService {
   }
 
   _buildProviderOrder() {
-    const requested = this.aiProviderPreference ? [this.aiProviderPreference] : [];
-    const defaults = ['ollama', 'doubao', 'openai', 'mock'];
-    // 去重并保留顺序
-    return [...new Set([...requested, ...defaults])];
+    // 若用户显式指定了 AI_PROVIDER，则视为“只用该 provider”，避免失败后继续尝试其它 provider 产生噪音日志。
+    // 想要自动兜底，请清空 AI_PROVIDER，让系统按默认顺序选择。
+    if (this.aiProviderPreference) {
+      return [...new Set([this.aiProviderPreference, 'mock'])];
+    }
+
+    return ['ollama', 'doubao', 'openai', 'mock'];
   }
 
   _providerAvailable(name) {
@@ -407,22 +410,11 @@ ${text}
       // 准备笔记数据摘要
       const notesSummary = this.prepareNotesSummary(notes);
       
-      // 构建完整的prompt
-      const fullPrompt = `${customPrompt}
-
-数据摘要：
-${notesSummary}
-
-请严格按照以下格式输出三个方面的洞察，每部分用标题开头，内容不超过100字：
-
-1. 一句话总结：
-[这里填写一句话总结]
-
-2. 笔记要点：
-[这里填写笔记要点]
-
-3. 延伸方向：
-[这里填写延伸方向]`;
+      // 构建完整的 prompt：由调用侧决定输出格式与约束（此处只拼接数据摘要）
+      const promptHeader = (customPrompt && typeof customPrompt === 'string' && customPrompt.trim())
+        ? customPrompt.trim()
+        : '你是个人笔记分析助手。请输出三段内容：主要洞察、变化趋势、建议。中文，每段不超过80字。';
+      const fullPrompt = `${promptHeader}\n\n数据摘要：\n${notesSummary}`;
 
       // 调用AI服务
       console.log('🤖 [generateInsights] 调用AI服务，prompt长度:', fullPrompt.length);
@@ -626,16 +618,30 @@ ${notesSummary}
 
     // 优先匹配新格式：一句话总结、笔记要点、延伸方向
     const summaryPatterns = [
+      /(?:1\.|一、)?\s*主要洞察[：:：\s]+\s*(.+?)(?=\d\.|二、|2\.|变化趋势|笔记要点|趋势分析|建议|个性化建议|延伸方向|$)/s,
+      /主要洞察[：:：\s]+\s*(.+?)(?=\d\.|二、|2\.|变化趋势|笔记要点|趋势分析|建议|个性化建议|延伸方向|$)/s,
       /(?:1\.|一、)?\s*一句话总结[：:：\s]+\s*(.+?)(?=\d\.|二、|2\.|笔记要点|趋势分析|建议|延伸方向|$)/s,
       /一句话总结[：:：\s]+\s*(.+?)(?=\d\.|二、|2\.|笔记要点|趋势分析|建议|延伸方向|$)/s,
       /1\.\s*(.+?)(?=\d\.|二、|2\.|笔记要点|趋势分析|建议|延伸方向|$)/s
     ];
     const pointsPatterns = [
+      /(?:2\.|二、)?\s*变化趋势[：:：\s]+\s*(.+?)(?=\d\.|三、|3\.|个性化建议|延伸方向|建议|$)/s,
+      /变化趋势[：:：\s]+\s*(.+?)(?=\d\.|三、|3\.|个性化建议|延伸方向|建议|$)/s,
       /(?:2\.|二、)?\s*笔记要点[：:：\s]+\s*(.+?)(?=\d\.|三、|3\.|延伸方向|建议|$)/s,
       /笔记要点[：:：\s]+\s*(.+?)(?=\d\.|三、|3\.|延伸方向|建议|$)/s,
       /2\.\s*(.+?)(?=\d\.|三、|3\.|延伸方向|建议|$)/s
     ];
     const directionPatterns = [
+      /(?:3\.|三、)?\s*个性化建议[：:：\s]+\s*(.+?)$/s,
+      /个性化建议[：:：\s]+\s*(.+?)$/s,
+      /(?:3\.|三、)?\s*建议[：:：\s]+\s*(.+?)$/s,
+      /建议[：:：\s]+\s*(.+?)$/s,
+      /(?:3\.|三、)?\s*(?:下一步学习建议|你可以重点关注|AI\s*学习提示)[：:：\s]+\s*(.+?)$/s,
+      /(?:下一步学习建议|你可以重点关注|AI\s*学习提示)[：:：\s]+\s*(.+?)$/s,
+      /(?:3\.|三、)?\s*(?:变化解读|风险提示)[：:：\s]+\s*(.+?)$/s,
+      /(?:变化解读|风险提示)[：:：\s]+\s*(.+?)$/s,
+      /(?:3\.|三、)?\s*(?:自我觉察|状态影响)[：:：\s]+\s*(.+?)$/s,
+      /(?:自我觉察|状态影响)[：:：\s]+\s*(.+?)$/s,
       /(?:3\.|三、)?\s*延伸方向[：:：\s]+\s*(.+?)$/s,
       /延伸方向[：:：\s]+\s*(.+?)$/s,
       /3\.\s*(.+?)$/s
@@ -702,15 +708,122 @@ ${notesSummary}
     const trendText = insights.trends || insights.trend || insights.points || '';
     const recommendation = insights.recommendations || insights.suggestion || insights.direction || '';
 
+    const truncateTo = (text, limit) => {
+      const s = String(text || '').trim();
+      if (!s) return '';
+      const n = Number(limit);
+      if (!Number.isFinite(n) || n <= 0) return s;
+      return s.length > n ? s.slice(0, n) : s;
+    };
+
+    const ensureJudgement = (text) => {
+      const s = String(text || '').trim();
+      if (!s) return '';
+      const starters = ['当前最明显的特征是', '核心特征是', '当前最值得注意的是'];
+      if (starters.some((k) => s.includes(k))) return s;
+      return `当前最明显的特征是：${s}`;
+    };
+
+    const ensureCompareAnchor = (text) => {
+      const s = String(text || '').trim();
+      if (!s) return '';
+      const anchors = ['相比更早阶段', '相比你过往的记录习惯', '相比同一主题的历史表现'];
+      if (anchors.some((k) => s.includes(k))) return s;
+      return `${s}；相比更早阶段，你的记录重点更集中。`;
+    };
+
+    const stripSummaryLabels = (text) => {
+      const s = String(text || '').trim();
+      if (!s) return '';
+      const labelRegex = /(阶段|下一步|因为|状态|可能影响|觉察|方向|原因)\s*[：:]/;
+      const hasLabels = labelRegex.test(s);
+
+      // 若模型输出了“阶段：…；下一步：…；因为：…”这类总结型结构，转为更自然的换行分段并去掉标签词。
+      if (hasLabels) {
+        const normalized = s
+          .replace(/\s*[；;]\s*/g, '\n')
+          .replace(/(阶段|下一步|因为|状态|可能影响|觉察|方向|原因)\s*[：:]\s*/g, '')
+          .split('\n')
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .join('\n');
+        return normalized.trim();
+      }
+
+      // 常规情况：仅清理行首的总结词（兼容“阶段：xxx”单行）
+      return s
+        .split('\n')
+        .map((line) =>
+          line
+            .replace(/^\s*(阶段|下一步|因为|状态|可能影响|觉察|方向|原因)\s*[：:]\s*/g, '')
+            .trimEnd()
+        )
+        .join('\n')
+        .trim();
+    };
+
+    const normalizeKnowledgeSuggestion = (text) => {
+      const s = String(text || '').trim();
+      if (!s) return '';
+
+      // 统一编号形式，并确保 1/2 项各占一行
+      let out = s
+        .replace(/(\d+)[、]/g, '$1.')
+        .replace(/(可以尝试|可尝试|不妨尝试)\s*[：:]\s*(?=\d+\.)/g, '$1：\n')
+        .replace(/([^\n])\s*(\d+\.)\s*/g, '$1\n$2 ');
+
+      // “为了……可以尝试：”单独成段（即使没有句号也拆分）
+      const pivotIdx = out.indexOf('为了');
+      if (pivotIdx > 0) {
+        const beforeChar = out[pivotIdx - 1];
+        if (beforeChar !== '\n') {
+          const before = out.slice(0, pivotIdx).trimEnd();
+          const after = out.slice(pivotIdx).trimStart();
+          out = `${before}\n${after}`;
+        }
+      }
+
+      // 尝试把“为了……可以尝试：”单独成行（承接第一段）
+      out = out.replace(/。\s*(为了[^。\n]{0,40}?(可以尝试|可尝试|不妨尝试)[:：])/g, '。\n$1');
+
+      // 若仍是一行且包含“可以尝试”，将其拆成两段（第一句 + 承接句）
+      if (!out.includes('\n') && /(可以尝试|可尝试|不妨尝试)/.test(out)) {
+        const idx = out.search(/(为了[^。\n]{0,40}?(可以尝试|可尝试|不妨尝试)[:：])|(可以尝试|可尝试|不妨尝试)[:：]/);
+        if (idx > 0) {
+          const head = out.slice(0, idx).trim();
+          const tail = out.slice(idx).trim();
+          out = [head, tail].filter(Boolean).join('\n');
+        }
+      }
+
+      // 压缩连续空行，清理行首空格
+      out = out
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line, index, arr) => line || (index > 0 && arr[index - 1]))
+        .join('\n')
+        .trim();
+
+      return out.trim();
+    };
+
+    const resolveSuggestionTitle = () => {
+      const t = String(notebookType || '').trim();
+      if (['finance', 'ai', 'study'].includes(t)) return '个性化建议';
+      if (t === 'mood') return '自我觉察';
+      if (t === 'monitoring' || t === 'accounting') return '变化解读';
+      return '个性化建议';
+    };
+
     const result = [];
     
-    // 如果有关键发现或总结，添加"一句话总结"
+    // 如果有关键发现或总结，添加"主要洞察"
     if (keyFinding && keyFinding.trim()) {
       result.push({
         id: 'insight_1',
-        title: '一句话总结',
-        summary: keyFinding.trim(),
-        description: keyFinding.trim(),
+        title: '主要洞察',
+        summary: truncateTo(ensureJudgement(keyFinding), 80),
+        description: truncateTo(ensureJudgement(keyFinding), 80),
         type: 'positive',
         confidence: 0.85,
         actionable: false,
@@ -718,13 +831,13 @@ ${notesSummary}
       });
     }
     
-    // 如果有趋势或要点，添加"笔记要点"
+    // 如果有趋势或要点，添加"变化趋势"
     if (trendText && trendText.trim()) {
       result.push({
         id: 'insight_2',
-        title: '笔记要点',
-        summary: trendText.trim(),
-        description: trendText.trim(),
+        title: '变化趋势',
+        summary: truncateTo(ensureCompareAnchor(trendText), 80),
+        description: truncateTo(ensureCompareAnchor(trendText), 80),
         type: 'trend',
         confidence: 0.78,
         actionable: false,
@@ -732,18 +845,25 @@ ${notesSummary}
       });
     }
     
-    // 如果有建议或延伸方向，添加"延伸方向"
+    // 如果有建议或延伸方向，添加"个性化建议"
     if (recommendation && recommendation.trim()) {
+      const suggestionTitle = resolveSuggestionTitle();
+      const t = String(notebookType || '').trim();
+      const cleaned = stripSummaryLabels(recommendation);
+      const structured = ['finance', 'ai', 'study'].includes(t)
+        ? normalizeKnowledgeSuggestion(cleaned)
+        : cleaned;
+      const normalizedRecommendation = truncateTo(structured, 220);
       result.push({
         id: 'insight_3',
-        title: '延伸方向',
-        summary: recommendation.trim(),
-        description: recommendation.trim(),
+        title: suggestionTitle,
+        summary: normalizedRecommendation,
+        description: normalizedRecommendation,
         type: 'suggestion',
         confidence: 0.82,
         actionable: true,
         evidence: [],
-        suggestions: typeof recommendation === 'string' ? recommendation.split(/\n+/).filter(Boolean) : []
+        suggestions: typeof normalizedRecommendation === 'string' ? normalizedRecommendation.split(/\n+/).filter(Boolean) : []
       });
     }
 
@@ -757,7 +877,7 @@ ${notesSummary}
     return [
       {
         id: 'insight_1',
-        title: '一句话总结',
+        title: '主要洞察',
         summary: '暂无足够数据进行分析',
         description: '暂无足够数据进行分析',
         type: 'positive',
@@ -767,7 +887,7 @@ ${notesSummary}
       },
       {
         id: 'insight_2',
-        title: '笔记要点',
+        title: '变化趋势',
         summary: '请先记录您的数据',
         description: '请先记录您的数据',
         type: 'trend',
@@ -777,7 +897,7 @@ ${notesSummary}
       },
       {
         id: 'insight_3',
-        title: '延伸方向',
+        title: '个性化建议',
         summary: '至少需要两条记录才能生成分析',
         description: '至少需要两条记录才能生成分析',
         type: 'suggestion',
@@ -826,7 +946,7 @@ ${notesSummary}
     return [
       {
         id: 'insight_1',
-        title: '一句话总结',
+        title: '主要洞察',
         summary: content.keyFindings,
         description: content.keyFindings,
         type: 'positive',
@@ -836,7 +956,7 @@ ${notesSummary}
       },
       {
         id: 'insight_2',
-        title: '笔记要点',
+        title: '变化趋势',
         summary: content.trends,
         description: content.trends,
         type: 'trend',
@@ -846,7 +966,7 @@ ${notesSummary}
       },
       {
         id: 'insight_3',
-        title: '延伸方向',
+        title: '个性化建议',
         summary: content.recommendations,
         description: content.recommendations,
         type: 'suggestion',
