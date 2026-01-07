@@ -26,6 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-0 \
   && rm -rf /var/lib/apt/lists/*
 
+RUN mkdir -p /data
+
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/src ./src
