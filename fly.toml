@@ -2,8 +2,8 @@ app = "echonotes"
 primary_region = "sin"
 
 [build]
-  dockerfile = "recovery/CLOUD_VERSION/backend/Dockerfile.fly"
-  ignorefile = "fly.dockerignore"
+  dockerfile = "Dockerfile"
+  ignorefile = ".dockerignore"
 
 [env]
   NODE_ENV = "production"
