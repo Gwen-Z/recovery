@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for echonotes-a5odgg on 2026-01-10T07:36:00Z
+# fly.toml app configuration file generated for echonotes0112 on 2026-01-12T06:12:15Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'echonotes-a5odgg'
+app = 'echonotes0112'
 primary_region = 'sin'
 
 [build]
