@@ -16,7 +16,7 @@ import {
   YAxis
 } from 'recharts';
 import apiClient, { type Notebook, type Note } from '../apiClient';
-import type { AnalysisV3ChartItem, AnalysisV3Preset, AnalysisV3Response } from '../types/Analysis';
+import type { AnalysisV3ChartItem, AnalysisV3Insight, AnalysisV3Preset, AnalysisV3Response } from '../types/Analysis';
 
 const PRESET_OPTIONS: Array<{ value: AnalysisV3Preset; label: string }> = [
   { value: '7d', label: '近7天' },
@@ -64,6 +64,9 @@ const toDateInputValue = (date: Date) => {
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 };
+
+const getRequestNoteIds = (request?: { noteIds?: string[] }) =>
+  Array.isArray(request?.noteIds) ? request.noteIds : [];
 
 const getErrorMessage = (error: unknown, fallback: string) => {
   if (!error) return fallback;
@@ -1457,8 +1460,9 @@ const AnalysisV2OnDemandPage = ({ notebookIdOverride }: AnalysisV2OnDemandPagePr
     } else {
       setHistoryRange(resolveHistoryRange(target));
     }
-    const explicitNoteIds = Array.isArray(target.request.noteIds) && target.request.noteIds.length > 0;
-    setSelectedNoteIds(explicitNoteIds ? target.request.noteIds : []);
+    const requestedNoteIds = getRequestNoteIds(target.request);
+    const explicitNoteIds = requestedNoteIds.length > 0;
+    setSelectedNoteIds(explicitNoteIds ? requestedNoteIds : []);
     setAutoSelectAllFromHistory(!explicitNoteIds);
   }, [notebookId, analysisHistory, historyIdParam]);
 
@@ -1873,9 +1877,9 @@ const AnalysisV2OnDemandPage = ({ notebookIdOverride }: AnalysisV2OnDemandPagePr
                             } else {
                               setHistoryRange(resolveHistoryRange(session));
                             }
-                            const hasNoteIds =
-                              Array.isArray(session.request.noteIds) && session.request.noteIds.length > 0;
-                            setSelectedNoteIds(hasNoteIds ? session.request.noteIds : []);
+                            const requestedNoteIds = getRequestNoteIds(session.request);
+                            const hasNoteIds = requestedNoteIds.length > 0;
+                            setSelectedNoteIds(hasNoteIds ? requestedNoteIds : []);
                             setAutoSelectAllFromHistory(!hasNoteIds);
                             setAnalysisHistoryOpen(false);
                           }}
@@ -1989,9 +1993,9 @@ const AnalysisV2OnDemandPage = ({ notebookIdOverride }: AnalysisV2OnDemandPagePr
                 } else {
                   setHistoryRange(resolveHistoryRange(matchedHistory));
                 }
-                const hasNoteIds =
-                  Array.isArray(matchedHistory.request.noteIds) && matchedHistory.request.noteIds.length > 0;
-                setSelectedNoteIds(hasNoteIds ? matchedHistory.request.noteIds : []);
+                const requestedNoteIds = getRequestNoteIds(matchedHistory.request);
+                const hasNoteIds = requestedNoteIds.length > 0;
+                setSelectedNoteIds(hasNoteIds ? requestedNoteIds : []);
                 setAutoSelectAllFromHistory(!hasNoteIds);
                 navigate(
                   `/analysis/v2/${matchedHistory.notebookId}?historyId=${encodeURIComponent(matchedHistory.id)}`,
