@@ -1312,7 +1312,7 @@ const AnalysisV2OnDemandPage = ({ notebookIdOverride }: AnalysisV2OnDemandPagePr
         const next = list
           .map((item: any) => buildHistoryRecordFromAnalysis(item))
           .filter((item: any): item is AnalysisHistoryRecord => Boolean(item))
-          .sort((a, b) => b.updatedAt - a.updatedAt)
+          .sort((a: AnalysisHistoryRecord, b: AnalysisHistoryRecord) => b.updatedAt - a.updatedAt)
           .slice(0, ANALYSIS_HISTORY_MAX_SESSIONS);
         setAnalysisHistory(next);
       } catch (loadError) {
